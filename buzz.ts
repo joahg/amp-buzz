@@ -1873,12 +1873,13 @@ export default function (amp: PluginAPI) {
 					label = matches[idx].display_name
 				}
 
-				// Plugin-created channels are owned by the session agent, so
-				// the add must be signed by it; /join-ed and legacy channels
-				// are administered by the user's key.
-				const inviter =
-					state.user_is_member === false && ctx.thread
-						? agentIdentity(sessionAgent(config, ctx.thread.id, state))
+				// Plugin-created channels are owned by the custodian (the
+				// session agent is only a bot there), so the add must be
+				// signed by it; /join-ed and legacy channels are
+				// administered by the user's key.
+				const inviter: Identity =
+					state.user_is_member === false
+						? agentIdentity(custodianIdentity(config))
 						: { seckey: config.userSeckey }
 				buzz(config, inviter, [
 					'channels',

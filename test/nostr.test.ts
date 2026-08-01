@@ -190,3 +190,40 @@ test('formatIncoming + INCOMING_RE round trip', async () => {
 	assert.ok(!INCOMING_RE.test('💬 emoji but not the shape'))
 	assert.ok(!INCOMING_RE.test('[buzz] emoji but not the shape'))
 })
+
+test('formatHistoryBlocks batches history under the block cap', async () => {
+	const { formatHistoryBlocks, INCOMING_RE, INCOMING_MARK } = await import('../buzz.ts')
+	assert.deepStrictEqual(formatHistoryBlocks([]), [])
+
+	const one = formatHistoryBlocks([{ author: 'joah', content: 'hello' }])
+	assert.deepStrictEqual(one, ['\u200bjoah: hello'])
+	assert.ok(INCOMING_RE.test(one[0]))
+
+	// small messages coalesce into one block, oldest first
+	const few = formatHistoryBlocks([
+		{ author: 'a', content: 'first' },
+		{ author: 'b', content: 'second' },
+	])
+	assert.deepStrictEqual(few, ['\u200ba: first\n\nb: second'])
+
+	// long histories split into multiple blocks, each marked and under cap
+	const many = Array.from({ length: 40 }, (_, i) => ({
+		author: `user${i}`,
+		content: 'x'.repeat(500),
+	}))
+	const blocks = formatHistoryBlocks(many, 2000)
+	assert.ok(blocks.length > 1)
+	for (const b of blocks) {
+		assert.ok(b.startsWith(INCOMING_MARK))
+		assert.ok(INCOMING_RE.test(b))
+		assert.ok(b.length <= 2000 + INCOMING_MARK.length)
+	}
+	// no message lost across the split
+	const joined = blocks.join('\n\n')
+	for (let i = 0; i < many.length; i++) assert.ok(joined.includes(`user${i}: `))
+
+	// an oversized single message is truncated rather than dropped
+	const big = formatHistoryBlocks([{ author: 'a', content: 'y'.repeat(5000) }], 2000)
+	assert.strictEqual(big.length, 1)
+	assert.ok(big[0].includes('truncated'))
+})

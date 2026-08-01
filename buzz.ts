@@ -518,6 +518,98 @@ export function sanitizeMentions(content: string, tokens: string[]): string {
 	return out
 }
 
+export interface ChannelInfo {
+	channel_id: string
+	name: string
+	description?: string
+}
+
+/** List relay channels visible to the user, filtered by a substring query. */
+export function listChannels(config: BuzzConfig, query = ''): ChannelInfo[] {
+	const res = buzz(config, { seckey: config.userSeckey }, ['channels', 'list', '--limit', '500'], {
+		allowFailure: true,
+	})
+	const channels: ChannelInfo[] = (Array.isArray(res) ? res : []).filter(
+		(c: any) => c && typeof c.channel_id === 'string' && typeof c.name === 'string',
+	)
+	const q = query.trim().toLowerCase()
+	const filtered = q
+		? channels.filter(
+				(c) =>
+					c.name.toLowerCase().includes(q) || (c.description || '').toLowerCase().includes(q),
+			)
+		: channels
+	return filtered.sort((a, b) => a.name.localeCompare(b.name))
+}
+
+export interface HistoryMessage {
+	id: string
+	pubkey: string
+	content: string
+	created_at: number
+}
+
+const HISTORY_PAGE = 200
+export const HISTORY_MAX = 500
+
+/**
+ * Fetch a channel's message history (up to `max` most recent messages),
+ * paginating backwards with --before. Returned oldest-first.
+ */
+export function fetchChannelHistory(
+	config: BuzzConfig,
+	channelId: string,
+	max = HISTORY_MAX,
+): HistoryMessage[] {
+	const byId = new Map<string, HistoryMessage>()
+	let before: number | undefined
+	for (let page = 0; page < Math.ceil(max / HISTORY_PAGE) + 1; page++) {
+		const args = ['messages', 'get', '--channel', channelId, '--limit', String(HISTORY_PAGE)]
+		if (before !== undefined) args.push('--before', String(before))
+		const res = buzz(config, { seckey: config.userSeckey }, args, { allowFailure: true })
+		const messages: any[] = Array.isArray(res) ? res : []
+		if (messages.length === 0) break
+		let oldest = Infinity
+		for (const m of messages) {
+			const id = m.event_id || m.id
+			const ts = m.created_at || 0
+			if (ts > 0 && ts < oldest) oldest = ts
+			if (!id || typeof m.content !== 'string' || !m.content.trim()) continue
+			byId.set(id, { id, pubkey: m.pubkey, content: m.content, created_at: ts })
+		}
+		if (messages.length < HISTORY_PAGE || !Number.isFinite(oldest) || byId.size >= max) break
+		before = oldest
+	}
+	return [...byId.values()].sort((a, b) => a.created_at - b.created_at).slice(-max)
+}
+
+/**
+ * Batch channel history into transcript-ready blocks. Each block carries the
+ * INCOMING_MARK prefix so agent.start cancels its turn, and stays under
+ * `maxBlock` chars so a long history imports as a handful of appends instead
+ * of one per message.
+ */
+export function formatHistoryBlocks(
+	messages: Array<{ author: string; content: string }>,
+	maxBlock = 8000,
+): string[] {
+	const blocks: string[] = []
+	let cur: string[] = []
+	let curLen = 0
+	for (const m of messages) {
+		const line = `${m.author}: ${truncate(m.content, 1500)}`
+		if (cur.length > 0 && curLen + line.length + 2 > maxBlock) {
+			blocks.push(INCOMING_MARK + cur.join('\n\n'))
+			cur = []
+			curLen = 0
+		}
+		cur.push(line)
+		curLen += line.length + 2
+	}
+	if (cur.length > 0) blocks.push(INCOMING_MARK + cur.join('\n\n'))
+	return blocks
+}
+
 export function channelMembers(
 	config: BuzzConfig,
 	channelId: string,
@@ -1271,6 +1363,109 @@ export default function (amp: PluginAPI) {
 				)
 			} catch (err) {
 				logError('command.catchup', err)
+			}
+		},
+	)
+
+	amp.registerCommand(
+		'join',
+		{
+			title: 'Join channel',
+			category: 'Buzz',
+			description: 'Join an existing Buzz channel in a new thread, importing its history',
+		},
+		async (ctx) => {
+			try {
+				const query = await ctx.ui.input({
+					title: 'Join a Buzz channel',
+					helpText: 'search channels by name or description (empty lists all)…',
+				})
+				if (query === null || query === undefined) return
+				const channels = listChannels(config, query)
+				if (channels.length === 0) {
+					await ctx.ui.notify(`No channels matching “${query}”`)
+					return
+				}
+				const shown = channels.slice(0, 50)
+				const options = shown.map((c) =>
+					c.description ? `#${c.name} — ${truncate(c.description, 80)}` : `#${c.name}`,
+				)
+				let chosen: string | undefined = options[0]
+				if (shown.length > 1) {
+					chosen = await ctx.ui.select({
+						title: `Join channel (${channels.length} match${channels.length === 1 ? '' : 'es'})`,
+						options,
+					})
+				}
+				const idx = chosen ? options.indexOf(chosen) : -1
+				if (idx === -1) return
+				const channel = shown[idx]
+
+				buzz(config, { seckey: config.userSeckey }, ['channels', 'join', '--channel', channel.channel_id], {
+					allowFailure: true,
+				})
+				// Best-effort: the thread agent must be a member to publish replies.
+				const agent = ensureAgentIdentity(config)
+				buzz(
+					config,
+					{ seckey: config.userSeckey },
+					[
+						'channels',
+						'add-member',
+						'--channel',
+						channel.channel_id,
+						'--pubkey',
+						agent.pubkey,
+						'--role',
+						'bot',
+					],
+					{ allowFailure: true },
+				)
+
+				const history = fetchChannelHistory(config, channel.channel_id)
+				const missing = [...new Set(history.map((m) => m.pubkey))].filter(
+					(p) => p && !nameCache.has(p),
+				)
+				if (missing.length > 0) {
+					const profiles = userProfiles(config, missing)
+					for (const p of missing) nameCache.set(p, profiles.get(p) || '')
+				}
+
+				const thread = await amp.getBuiltinAgent('medium').createThread({ show: true })
+				const now = Math.floor(Date.now() / 1000)
+				const newest = history.length > 0 ? history[history.length - 1].created_at : now
+				const state: SessionState = {
+					channel_id: channel.channel_id,
+					channel_name: channel.name,
+					created_at: now,
+					last_seen: newest,
+					seen_event_ids: history.slice(-300).map((m) => m.id),
+				}
+				saveSession(thread.id, state)
+				watchedThreads.add(thread.id)
+
+				const named = history.map((m) => ({
+					author:
+						(m.pubkey === agent.pubkey ? AGENT_NAME : nameCache.get(m.pubkey)) ||
+						(m.pubkey ? m.pubkey.slice(0, 8) : 'unknown'),
+					content: m.content,
+				}))
+				for (const block of formatHistoryBlocks(named)) {
+					appendedRelay.add(block)
+					try {
+						await thread.appendUserMessage({ type: 'user-message', content: block })
+					} catch (err) {
+						appendedRelay.delete(block)
+						logError('command.join.append', err)
+					}
+				}
+				await ctx.ui.notify(
+					`Joined #${channel.name}` +
+						(history.length > 0 ? ` — imported ${history.length} messages` : ''),
+				)
+			} catch (err) {
+				logError('command.join', err)
+				await ctx.ui.notify(`Join failed: ${err instanceof Error ? err.message : err}`)
 			}
 		},
 	)

@@ -2,10 +2,10 @@
 
 Turn the [Amp](https://ampcode.com) TUI into a **[buzz://](https://github.com/block/buzz) client**.
 
-Every Amp thread becomes a private channel on your Buzz relay. Your prompts and Amp's replies are published there as signed Nostr events — so any Buzz client (Buzz Desktop, mobile, another agent) can follow the thread live, and remote collaborators can post messages that reach Amp as context on your next turn.
+Every Amp thread becomes a private channel on your Buzz relay, created and owned by a per-session agent identity — your account is never added, so mirrored threads don't clutter your Buzz sidebar. Prompts and replies are published there as signed Nostr events, so any Buzz client (Buzz Desktop, mobile, another agent) can follow the thread live, and remote collaborators can post messages that reach Amp as context on your next turn.
 
 ```
-┌────────────────┐  prompts (your key)         ┌──────────────┐
+┌────────────────┐  prompts (agent key)        ┌──────────────┐
 │  Amp           │────────────────────────────▶│  Buzz relay  │
 │  + this plugin │  replies (agent key)        │  channel     │
 │                │────────────────────────────▶│  joah--…     │
@@ -21,7 +21,8 @@ Every Amp thread becomes a private channel on your Buzz relay. Your prompts and 
 ## How it maps to the Buzz protocol
 
 - **One thread = one channel.** The first prompt of a thread creates a private channel named `<your-username>--<slug-of-first-prompt>` (the `parent--sub` convention, kind 9007), using your relay profile name. The channel is the durable record of the thread. [claude-code-buzz](https://github.com/joahg/claude-code-buzz) uses the same naming scheme.
-- **Per-session identities.** Prompts are published under **your** Nostr key. Amp's replies are published under a dedicated **agent keypair minted for each session (thread)** — never your key, never shared between sessions — so every Amp session appears on the relay as its own agent (e.g. `Amp (myhost-019fbdce)`). Each agent key carries a [NIP-OA](https://github.com/block/buzz/blob/main/docs/nips/NIP-OA.md) owner attestation minted with your key, so any client can verify you authorized it.
+- **Per-session identities.** Everything in a plugin-created channel is published under a dedicated **agent keypair minted for each session (thread)** — never your key, never shared between sessions — so every Amp session appears on the relay as its own agent (e.g. `Amp (myhost-019fbdce)`). Each agent key carries a [NIP-OA](https://github.com/block/buzz/blob/main/docs/nips/NIP-OA.md) owner attestation minted with your key, so any client can verify you authorized it.
+- **Your account stays out.** The session agent creates and owns the channel; you are never added as a member, so mirrored threads don't appear in your sidebar. Your prompts are published by the agent prefixed with your display name (`joah: …`). Use `Buzz: Invite` to add yourself (or anyone) when you want to follow a thread from Buzz. Channels you import with `/join` behave as before: you're a member there, and your prompts publish under your own key.
 - **Explicit turns.** Remote messages never trigger Amp automatically. They appear live in the chat transcript as `<author>: …` messages and become context for your next prompt — but the plugin cancels their turns so they never dispatch inference.
 - **Graceful degradation.** No relay configured → the plugin does nothing and Amp behaves exactly as before. The plugin also stays inert when the Amp process is itself a managed Buzz agent (`BUZZ_MANAGED_AGENT` or `BUZZ_AUTH_TAG` set) — those turns already live on the relay.
 - **Client-only.** Works against a stock Buzz relay; no relay changes needed.
@@ -65,7 +66,7 @@ When a session's channel is created (first prompt or `/join`), the plugin mints 
 
 Just talk to Amp. The first prompt creates the channel and mirrors from there on.
 
-**Chat without prompting Amp.** Press `Tab` until the mode picker shows **buzz chat**, then type — your message posts to the thread's channel under your key and Amp never runs. In any mode, a prompt starting with `\` does the same (`\lunch?` posts "lunch?" to the channel — Amp's slash-command UI captures a leading `/`, so backslash is the escape).
+**Chat without prompting Amp.** Press `Tab` until the mode picker shows **buzz chat**, then type — your message posts to the thread's channel and Amp never runs (under your key in channels you're a member of, otherwise by the agent with your name prefixed). In any mode, a prompt starting with `\` does the same (`\lunch?` posts "lunch?" to the channel — Amp's slash-command UI captures a leading `/`, so backslash is the escape).
 
 **Live incoming messages.** New messages from collaborators appear directly in the Amp chat within seconds (10 s poll) as `<author>: …` messages. By default they never trigger Amp by themselves — the plugin cancels the turn before inference — but they become thread history, so Amp naturally sees them on your next prompt.
 
@@ -79,7 +80,7 @@ Command palette (`Buzz:` category):
 |---------|--------------|
 | `Buzz: Status` | Show relay, identities, and this thread's channel |
 | `Buzz: Invite` | Search relay users by name (or paste a pubkey/npub) and add them to the thread channel |
-| `Buzz: Chat` | Post channel chat under your key — visible to collaborators, does **not** prompt Amp |
+| `Buzz: Chat` | Post channel chat — visible to collaborators, does **not** prompt Amp |
 | `Buzz: Catch up` | Show new remote messages now (they still reach Amp on your next turn) |
 
 ## What is (and isn't) mirrored

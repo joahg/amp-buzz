@@ -2,11 +2,14 @@
 /**
  * amp-buzz — turn Amp into a buzz:// client.
  *
- * Every Amp thread is mirrored to a private channel on your Buzz relay:
- * your prompts publish under your key, the assistant's replies publish
- * under a dedicated agent key carrying a NIP-OA owner attestation, and
- * channel messages posted from Buzz (by collaborators or by you) appear
- * in the Amp chat transcript (never auto-dispatching a turn).
+ * Every Amp thread is mirrored to a private channel on your Buzz relay,
+ * created and owned by a dedicated per-session agent key carrying a NIP-OA
+ * owner attestation. Your user account is never added to these channels
+ * (they stay out of your Buzz sidebar): prompts and replies both publish
+ * under the agent key, prompts prefixed with your display name. Channels
+ * you join explicitly (/join) keep publishing your prompts under your key.
+ * Channel messages posted from Buzz (by collaborators) appear in the Amp
+ * chat transcript (never auto-dispatching a turn).
  *
  * Install: copy this file to ~/.config/amp/plugins/buzz.ts and set
  * BUZZ_RELAY_URL + BUZZ_PRIVATE_KEY (or write them to
@@ -348,6 +351,15 @@ export interface SessionState {
 	last_seen: number
 	seen_event_ids: string[]
 	agent?: SessionAgentRecord
+	/**
+	 * Whether the user's account is a member of the channel. False for
+	 * channels this plugin creates (agent-owned; the user is never added,
+	 * so they stay out of the user's sidebar) — there the user's prompts
+	 * publish under the agent key with a `<name>: ` prefix, because the
+	 * relay rejects posts to private channels from non-members.
+	 * Absent (legacy sessions) and /join-ed channels mean true.
+	 */
+	user_is_member?: boolean
 }
 
 export function readJson<T>(file: string, fallback: T | null = null): T | null {
@@ -426,6 +438,11 @@ interface Identity {
 	authTag?: AuthTag
 }
 
+/** CLI identity for an agent key (seckey + NIP-OA attestation). */
+function agentIdentity(agent: AgentIdentity): Identity {
+	return { seckey: agent.seckey, authTag: agent.authTag }
+}
+
 function buzzEnv(config: BuzzConfig, identity: Identity): NodeJS.ProcessEnv {
 	const env: NodeJS.ProcessEnv = {
 		...process.env,
@@ -499,7 +516,12 @@ export function buzzSend(
 	if (!first || !first.error) return first
 	if (!/mention/i.test(String(first.message))) throw new Error(String(first.message))
 
-	const { content: resolvedContent, mentions: extra } = resolveMentions(config, channelId, content)
+	const { content: resolvedContent, mentions: extra } = resolveMentions(
+		config,
+		channelId,
+		content,
+		identity,
+	)
 	const second = buzz(
 		config,
 		identity,
@@ -638,13 +660,11 @@ export function formatHistoryBlocks(
 export function channelMembers(
 	config: BuzzConfig,
 	channelId: string,
+	identity: Identity = { seckey: config.userSeckey },
 ): Array<{ pubkey: string; role?: string }> {
-	const res = buzz(
-		config,
-		{ seckey: config.userSeckey },
-		['channels', 'members', '--channel', channelId],
-		{ allowFailure: true },
-	)
+	const res = buzz(config, identity, ['channels', 'members', '--channel', channelId], {
+		allowFailure: true,
+	})
 	return Array.isArray(res) ? res : []
 }
 
@@ -689,11 +709,12 @@ export function resolveMentions(
 	config: BuzzConfig,
 	channelId: string,
 	content: string,
+	identity: Identity = { seckey: config.userSeckey },
 ): { content: string; mentions: string[] } {
 	const tokens = extractMentionTokens(content)
 	if (tokens.length === 0) return { content, mentions: [] }
 
-	const members = channelMembers(config, channelId)
+	const members = channelMembers(config, channelId, identity)
 	const memberPubkeys = new Set(members.map((m) => m.pubkey))
 	const profiles = userProfiles(config, [...memberPubkeys])
 	const mentions: string[] = []
@@ -712,7 +733,7 @@ export function resolveMentions(
 		if (matches.length === 1) {
 			buzz(
 				config,
-				{ seckey: config.userSeckey },
+				identity,
 				[
 					'channels',
 					'add-member',
@@ -931,9 +952,10 @@ export function resolveUsername(config: BuzzConfig): string {
 }
 
 /**
- * Create the session channel following the required bootstrap order:
- * create channel → add agent as member with role bot →
- * first prompt (sent by the caller) carries the agent's p-tag mention.
+ * Create the session channel, signed by the session's agent identity: the
+ * agent becomes the channel's owner (and sole member). The user's account is
+ * deliberately never added, so plugin-created channels stay out of the
+ * user's Buzz sidebar.
  */
 export function createSessionChannel(
 	config: BuzzConfig,
@@ -947,7 +969,7 @@ export function createSessionChannel(
 	for (let attempt = 0; attempt < 3 && !channel; attempt++) {
 		const res = buzz(
 			config,
-			{ seckey: config.userSeckey },
+			agentIdentity(agent),
 			[
 				'channels',
 				'create',
@@ -970,24 +992,24 @@ export function createSessionChannel(
 		}
 	}
 	if (!channel) throw new Error('failed to create session channel')
-
-	buzz(config, { seckey: config.userSeckey }, [
-		'channels',
-		'add-member',
-		'--channel',
-		channel.id,
-		'--pubkey',
-		agent.pubkey,
-		'--role',
-		'bot',
-	])
 	return channel
 }
 
+let cachedOwnerName: string | null = null
+
+/** The user's relay display name, for attributing agent-signed prompts. Memoized. */
+export function ownerName(config: BuzzConfig): string {
+	cachedOwnerName ??= userProfiles(config, [config.userPubkey]).get(config.userPubkey) || null
+	return cachedOwnerName || config.userPubkey.slice(0, 8)
+}
+
 /**
- * Publish a user prompt to the channel, signed by the user's key. Always
- * @-tags the thread's agent identity — both as a mention tag and as visible
- * `@<agent name>` text — so Buzz clients show who the prompt is directed at.
+ * Publish a user prompt to the channel. In channels where the user is a
+ * member (/join-ed and legacy sessions) it publishes under the user's key,
+ * @-tagging the thread's agent so Buzz clients show who it is directed at.
+ * In plugin-created channels the user is not a member (the relay would
+ * reject their post), so it publishes under the agent key, prefixed with
+ * the user's display name for attribution.
  */
 export function mirrorPrompt(
 	config: BuzzConfig,
@@ -995,6 +1017,10 @@ export function mirrorPrompt(
 	state: SessionState,
 	prompt: string,
 ): any {
+	if (state.user_is_member === false) {
+		const content = `${ownerName(config)}: ${truncate(prompt)}`
+		return buzzSend(config, agentIdentity(agent), state.channel_id, content)
+	}
 	const content = `@${agent.name} ${truncate(prompt)}`
 	return buzzSend(config, { seckey: config.userSeckey }, state.channel_id, content, {
 		mentions: [agent.pubkey],
@@ -1008,12 +1034,7 @@ export function mirrorReply(
 	state: SessionState,
 	reply: string,
 ): any {
-	return buzzSend(
-		config,
-		{ seckey: agent.seckey, authTag: agent.authTag },
-		state.channel_id,
-		truncate(reply),
-	)
+	return buzzSend(config, agentIdentity(agent), state.channel_id, truncate(reply))
 }
 
 export interface RemoteMessage {
@@ -1044,7 +1065,9 @@ export function fetchRemoteMessages(
 ): RemoteMessage[] {
 	const args = ['messages', 'get', '--channel', state.channel_id, '--limit', '100']
 	if (state.last_seen) args.push('--since', String(state.last_seen))
-	const res = buzz(config, { seckey: config.userSeckey }, args, { allowFailure: true })
+	// Read as the agent: it is a member of every session channel, while the
+	// user is not a member of plugin-created ones.
+	const res = buzz(config, agentIdentity(agent), args, { allowFailure: true })
 	if (!res || res.error) return []
 	const messages: any[] = Array.isArray(res) ? res : res.messages || res.events || []
 	const seen = new Set(state.seen_event_ids || [])
@@ -1198,6 +1221,7 @@ export default function (amp: PluginAPI) {
 			created_at: Math.floor(Date.now() / 1000),
 			last_seen: Math.floor(Date.now() / 1000) - 5,
 			seen_event_ids: [],
+			user_is_member: false,
 			agent: {
 				seckey: agent.seckey,
 				pubkey: agent.pubkey,
@@ -1243,10 +1267,22 @@ export default function (amp: PluginAPI) {
 		)
 	}
 
-	/** Post chat text to the thread's channel under the user's key. */
+	/**
+	 * Post chat text to the thread's channel: under the user's key where the
+	 * user is a member, otherwise under the agent key with a name prefix
+	 * (plugin-created channels never include the user).
+	 */
 	function postChat(threadId: string, text: string): SessionState {
-		const { state } = ensureSession(threadId, text)
-		const sent = buzzSend(config!, { seckey: config!.userSeckey }, state.channel_id, text)
+		const { state, agent } = ensureSession(threadId, text)
+		const sent =
+			state.user_is_member === false
+				? buzzSend(
+						config!,
+						agentIdentity(agent),
+						state.channel_id,
+						`${ownerName(config!)}: ${text}`,
+					)
+				: buzzSend(config!, { seckey: config!.userSeckey }, state.channel_id, text)
 		recordOwnEvent(threadId, state, sent)
 		return state
 	}
@@ -1284,7 +1320,7 @@ export default function (amp: PluginAPI) {
 					for (const m of remote) {
 						let trigger = false
 						if (m.mentions_agent) {
-							members ??= channelMembers(config!, state.channel_id)
+							members ??= channelMembers(config!, state.channel_id, agentIdentity(agent))
 							trigger = senderMayTrigger(config!, m.pubkey, members)
 						}
 						const text = trigger ? formatTrigger(m) : formatIncoming(m)
@@ -1484,7 +1520,14 @@ export default function (amp: PluginAPI) {
 					label = matches[idx].display_name
 				}
 
-				buzz(config, { seckey: config.userSeckey }, [
+				// Plugin-created channels are owned by the session agent, so
+				// the add must be signed by it; /join-ed and legacy channels
+				// are administered by the user's key.
+				const inviter =
+					state.user_is_member === false && ctx.thread
+						? agentIdentity(sessionAgent(config, ctx.thread.id, state))
+						: { seckey: config.userSeckey }
+				buzz(config, inviter, [
 					'channels',
 					'add-member',
 					'--channel',
@@ -1520,8 +1563,8 @@ export default function (amp: PluginAPI) {
 					title: `Chat on #${state.channel_name}`,
 					helpText: 'message…',
 				})
-				if (!content) return
-				buzzSend(config, { seckey: config.userSeckey }, state.channel_id, content)
+				if (!content || !ctx.thread) return
+				postChat(ctx.thread.id, content)
 				await ctx.ui.notify(`Posted to #${state.channel_name}`)
 			} catch (err) {
 				logError('command.chat', err)
@@ -1634,6 +1677,7 @@ export default function (amp: PluginAPI) {
 					created_at: now,
 					last_seen: newest,
 					seen_event_ids: history.slice(-300).map((m) => m.id),
+					user_is_member: true,
 					agent: {
 						seckey: agent.seckey,
 						pubkey: agent.pubkey,

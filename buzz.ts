@@ -5,8 +5,8 @@
  * Every Amp thread is mirrored to a private channel on your Buzz relay:
  * your prompts publish under your key, the assistant's replies publish
  * under a dedicated agent key carrying a NIP-OA owner attestation, and
- * messages from remote collaborators are injected as context on your
- * next turn (never auto-dispatching a turn).
+ * channel messages posted from Buzz (by collaborators or by you) appear
+ * in the Amp chat transcript (never auto-dispatching a turn).
  *
  * Install: copy this file to ~/.config/amp/plugins/buzz.ts and set
  * BUZZ_RELAY_URL + BUZZ_PRIVATE_KEY (or write them to
@@ -820,13 +820,21 @@ export interface RemoteMessage {
 }
 
 /**
- * Fetch channel messages that arrived from remote participants (anyone other
- * than the local user and agent) since the last check. Advances the cursor.
+ * Fetch channel messages that arrived from Buzz (anyone other than the thread
+ * agent, plus the user's own Buzz-native messages) since the last check.
+ * Events this plugin itself published (mirrored prompts/chat) are excluded
+ * via `ownEventIds` and the persisted seen set. Advances the cursor.
+ * Author pubkeys are resolved to relay profile display names, memoized in
+ * `nameCache` ('' marks a known miss so it isn't re-queried).
  */
 export function fetchRemoteMessages(
 	config: BuzzConfig,
 	agent: AgentIdentity,
 	state: SessionState,
+	{
+		ownEventIds,
+		nameCache,
+	}: { ownEventIds?: Set<string>; nameCache?: Map<string, string> } = {},
 ): RemoteMessage[] {
 	const args = ['messages', 'get', '--channel', state.channel_id, '--limit', '100']
 	if (state.last_seen) args.push('--since', String(state.last_seen))
@@ -834,16 +842,15 @@ export function fetchRemoteMessages(
 	if (!res || res.error) return []
 	const messages: any[] = Array.isArray(res) ? res : res.messages || res.events || []
 	const seen = new Set(state.seen_event_ids || [])
-	const locals = new Set([config.userPubkey, agent.pubkey])
 	const remote: RemoteMessage[] = []
 	let maxTs = state.last_seen || 0
 	for (const m of messages) {
 		const id = m.event_id || m.id
 		const ts = m.created_at || 0
 		if (ts > maxTs) maxTs = ts
-		if (id && seen.has(id)) continue
+		if (id && (seen.has(id) || ownEventIds?.has(id))) continue
 		if (id) seen.add(id)
-		if (locals.has(m.pubkey)) continue
+		if (m.pubkey === agent.pubkey) continue
 		if (typeof m.content !== 'string' || !m.content.trim()) continue
 		remote.push({
 			id,
@@ -856,20 +863,36 @@ export function fetchRemoteMessages(
 	}
 	state.last_seen = maxTs
 	state.seen_event_ids = [...seen].slice(-300)
+
+	const cache = nameCache ?? new Map<string, string>()
+	const missing = [...new Set(remote.map((r) => r.pubkey))].filter(
+		(p) => p && !cache.has(p),
+	)
+	if (missing.length > 0) {
+		const profiles = userProfiles(config, missing)
+		for (const p of missing) cache.set(p, profiles.get(p) || '')
+	}
+	for (const r of remote) {
+		const name = cache.get(r.pubkey)
+		if (name) r.author = name
+	}
 	return remote
 }
 
 /**
  * Render an incoming relay message as it appears in the Amp transcript.
- * The `💬 <author> in #<channel>:` shape is also the marker agent.start uses
- * to recognize plugin-appended messages and cancel their turn.
+ * The `💬 <author>:` shape is also the marker agent.start uses to recognize
+ * plugin-appended messages and cancel their turn.
  */
-export function formatIncoming(m: RemoteMessage, channelName: string): string {
-	return `💬 ${m.author} in #${channelName}: ${truncate(m.content, 4000)}`.trim()
+export function formatIncoming(m: RemoteMessage): string {
+	return `💬 ${m.author}: ${truncate(m.content, 4000)}`.trim()
 }
 
-/** Matches the formatIncoming shape — fallback detection across plugin reloads. */
-export const INCOMING_RE = /^💬 .{1,80} in #[a-z0-9._-]{1,64}: /s
+/**
+ * Matches the formatIncoming shape — fallback detection across plugin
+ * reloads. Also still matches the older `💬 <author> in #<channel>:` shape.
+ */
+export const INCOMING_RE = /^💬 .{1,80}?: /s
 
 /** Collect the assistant's text output from an agent.end message list. */
 export function extractAssistantText(messages: ThreadMessage[]): string {
@@ -934,19 +957,35 @@ export default function (amp: PluginAPI) {
 		return { state, created: true }
 	}
 
+	// Event IDs this plugin published itself (mirrored prompts, chat posts):
+	// the poller must not echo them back into the transcript. Also persisted
+	// in seen_event_ids so the exclusion survives plugin reloads.
+	const ownEventIds = new Set<string>()
+	const nameCache = new Map<string, string>()
+
+	function recordOwnEvent(threadId: string, state: SessionState, res: any): void {
+		const id = res && !res.error && typeof res.event_id === 'string' ? res.event_id : null
+		if (!id) return
+		ownEventIds.add(id)
+		state.seen_event_ids = [...(state.seen_event_ids || []), id].slice(-300)
+		saveSession(threadId, state)
+	}
+
 	/** Post chat text to the thread's channel under the user's key. */
 	function postChat(threadId: string, text: string): SessionState {
 		const { state } = ensureSession(threadId, text)
-		buzzSend(config!, { seckey: config!.userSeckey }, state.channel_id, text)
+		const sent = buzzSend(config!, { seckey: config!.userSeckey }, state.channel_id, text)
+		recordOwnEvent(threadId, state, sent)
 		return state
 	}
 
 	// -------------------------------------------------------------------
-	// Live incoming messages: poll watched threads and append new remote
-	// messages straight into the Amp chat transcript. Each append starts a
-	// turn that agent.start recognizes (via `appendedRelay` or the message
-	// shape) and cancels — the message is visible in the chat and becomes
-	// thread history for the agent's next real turn, but never dispatches
+	// Live incoming messages: poll watched threads and append new channel
+	// messages (remote collaborators and the user's own Buzz-native posts)
+	// straight into the Amp chat transcript. Each append starts a turn that
+	// agent.start recognizes (via `appendedRelay` or the message shape) and
+	// cancels — the message is visible in the chat and becomes thread
+	// history for the agent's next real turn, but never dispatches
 	// inference by itself.
 	// -------------------------------------------------------------------
 	const watchedThreads = new Set<ThreadID>()
@@ -962,10 +1001,10 @@ export default function (amp: PluginAPI) {
 					const state = loadSession(threadId)
 					if (!state || !state.channel_id) continue
 					const agent = ensureAgentIdentity(config!)
-					const remote = fetchRemoteMessages(config!, agent, state)
+					const remote = fetchRemoteMessages(config!, agent, state, { ownEventIds, nameCache })
 					saveSession(threadId, state)
 					for (const m of remote) {
-						const text = formatIncoming(m, state.channel_name)
+						const text = formatIncoming(m)
 						appendedRelay.add(text)
 						try {
 							await amp.threads
@@ -1036,7 +1075,8 @@ export default function (amp: PluginAPI) {
 			const { state, created: firstPrompt } = ensureSession(event.thread.id, prompt)
 			watchedThreads.add(event.thread.id)
 
-			mirrorPrompt(config, agent, state, prompt, { mentionAgent: firstPrompt })
+			const sent = mirrorPrompt(config, agent, state, prompt, { mentionAgent: firstPrompt })
+			recordOwnEvent(event.thread.id, state, sent)
 
 			if (firstPrompt) {
 				return {
@@ -1202,7 +1242,7 @@ export default function (amp: PluginAPI) {
 				// Peek without advancing the cursor so the poller still appends
 				// these messages into the chat transcript.
 				const peek: SessionState = { ...state, seen_event_ids: [...state.seen_event_ids] }
-				const remote = fetchRemoteMessages(config, agent, peek)
+				const remote = fetchRemoteMessages(config, agent, peek, { ownEventIds, nameCache })
 				await ctx.ui.notify(
 					remote.length === 0
 						? `No new remote messages on #${state.channel_name}`

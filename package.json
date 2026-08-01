@@ -1,0 +1,17 @@
+{
+	"name": "amp-buzz",
+	"version": "0.1.0",
+	"description": "Amp plugin that mirrors every thread to a channel on your Buzz relay, so humans and agents can collaborate on it from any Buzz client.",
+	"type": "module",
+	"author": {
+		"name": "Joah Gerstenberg",
+		"url": "https://github.com/joahg"
+	},
+	"homepage": "https://github.com/joahg/amp-buzz",
+	"repository": "https://github.com/joahg/amp-buzz",
+	"license": "Apache-2.0",
+	"keywords": ["amp", "buzz", "nostr", "collaboration", "relay", "multiplayer"],
+	"scripts": {
+		"test": "node --test test/nostr.test.ts"
+	}
+}

@@ -191,6 +191,44 @@ test('formatIncoming + INCOMING_RE round trip', async () => {
 	assert.ok(!INCOMING_RE.test('[buzz] emoji but not the shape'))
 })
 
+test('formatTrigger + TRIGGER_RE round trip', async () => {
+	const { formatTrigger, TRIGGER_RE, INCOMING_RE } = await import('../buzz.ts')
+	const m = {
+		id: 'e2',
+		pubkey: 'p2',
+		author: 'suz',
+		content: '@Amp take a look at this',
+		created_at: 2,
+		mentions_agent: true,
+	}
+	const text = formatTrigger(m)
+	assert.strictEqual(text, '\u2060suz: @Amp take a look at this')
+	assert.ok(TRIGGER_RE.test(text))
+	// trigger and context markers must not overlap
+	assert.ok(!INCOMING_RE.test(text))
+	assert.ok(!TRIGGER_RE.test('\u200bsuz: context-only message'))
+	assert.ok(!TRIGGER_RE.test('ordinary prompt: with a colon'))
+})
+
+test('senderMayTrigger permission model', async () => {
+	const { senderMayTrigger } = await import('../buzz.ts')
+	const config = { userPubkey: 'me', triggerPubkeys: ['friend'] }
+	const members = [
+		{ pubkey: 'chan-owner', role: 'owner' },
+		{ pubkey: 'chan-admin', role: 'admin' },
+		{ pubkey: 'chan-member', role: 'member' },
+		{ pubkey: 'chan-bot', role: 'bot' },
+	]
+	assert.ok(senderMayTrigger(config, 'me', members))
+	assert.ok(senderMayTrigger(config, 'friend', members))
+	assert.ok(senderMayTrigger(config, 'chan-owner', members))
+	assert.ok(senderMayTrigger(config, 'chan-admin', members))
+	assert.ok(!senderMayTrigger(config, 'chan-member', members))
+	assert.ok(!senderMayTrigger(config, 'chan-bot', members))
+	assert.ok(!senderMayTrigger(config, 'stranger', members))
+	assert.ok(!senderMayTrigger(config, '', members))
+})
+
 test('formatHistoryBlocks batches history under the block cap', async () => {
 	const { formatHistoryBlocks, INCOMING_RE, INCOMING_MARK } = await import('../buzz.ts')
 	assert.deepStrictEqual(formatHistoryBlocks([]), [])

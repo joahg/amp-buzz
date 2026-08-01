@@ -323,6 +323,8 @@ export interface BuzzConfig {
 	userPubkey: string
 	buzzBin: string
 	channelPrefix: string
+	/** Extra pubkeys (beyond the owner and channel owners/admins) allowed to trigger turns by mentioning the agent. */
+	triggerPubkeys: string[]
 }
 
 export interface AgentIdentity {
@@ -383,12 +385,26 @@ export function loadConfig(): BuzzConfig | null {
 	const rawKey = process.env.BUZZ_PRIVATE_KEY || file.private_key
 	if (!relayUrl || !rawKey) return null
 	const userSeckey = normalizeSecretKey(rawKey)
+	const rawTriggers = process.env.AMP_BUZZ_TRIGGER_PUBKEYS
+		? process.env.AMP_BUZZ_TRIGGER_PUBKEYS.split(',')
+		: Array.isArray((file as Record<string, unknown>).trigger_pubkeys)
+			? ((file as Record<string, unknown>).trigger_pubkeys as string[])
+			: []
+	const triggerPubkeys: string[] = []
+	for (const raw of rawTriggers) {
+		try {
+			triggerPubkeys.push(normalizePublicKey(String(raw).trim()))
+		} catch {
+			// skip invalid entries
+		}
+	}
 	return {
 		relayUrl,
 		userSeckey,
 		userPubkey: getPublicKey(userSeckey),
 		buzzBin: process.env.AMP_BUZZ_BIN || file.buzz_bin || 'buzz',
 		channelPrefix: process.env.AMP_BUZZ_CHANNEL_PREFIX || file.channel_prefix || 'amp',
+		triggerPubkeys,
 	}
 }
 
@@ -1005,6 +1021,38 @@ export function formatIncoming(m: RemoteMessage): string {
  */
 export const INCOMING_RE = /^(?:\u200b|\[buzz\] |💬 ).{1,80}?: /s
 
+/**
+ * Render a relay message that should dispatch a real agent turn (an
+ * authorized sender mentioned the agent). Same visible `<author>: <content>`
+ * shape as formatIncoming, but marked with an invisible word joiner so
+ * agent.start lets the turn run while still skipping the mirror-back.
+ */
+export const TRIGGER_MARK = '\u2060'
+
+export function formatTrigger(m: RemoteMessage): string {
+	return `${TRIGGER_MARK}${m.author}: ${truncate(m.content, 4000)}`.trim()
+}
+
+/** Matches the formatTrigger shape — fallback detection across plugin reloads. */
+export const TRIGGER_RE = /^\u2060.{1,80}?: /s
+
+/**
+ * Whether a relay sender is allowed to trigger an agent turn by mentioning
+ * the agent: the plugin owner, a channel owner/admin, or an explicitly
+ * configured trigger pubkey.
+ */
+export function senderMayTrigger(
+	config: BuzzConfig,
+	senderPubkey: string,
+	members: Array<{ pubkey: string; role?: string }>,
+): boolean {
+	if (!senderPubkey) return false
+	if (senderPubkey === config.userPubkey) return true
+	if (config.triggerPubkeys.includes(senderPubkey)) return true
+	const role = members.find((m) => m.pubkey === senderPubkey)?.role
+	return role === 'owner' || role === 'admin'
+}
+
 /** Collect the assistant's text output from an agent.end message list. */
 export function extractAssistantText(messages: ThreadMessage[]): string {
 	const parts: string[] = []
@@ -1093,14 +1141,19 @@ export default function (amp: PluginAPI) {
 	// -------------------------------------------------------------------
 	// Live incoming messages: poll watched threads and append new channel
 	// messages (remote collaborators and the user's own Buzz-native posts)
-	// straight into the Amp chat transcript. Each append starts a turn that
-	// agent.start recognizes (via `appendedRelay` or the message shape) and
-	// cancels — the message is visible in the chat and becomes thread
-	// history for the agent's next real turn, but never dispatches
-	// inference by itself.
+	// straight into the Amp chat transcript. Each append starts a turn.
+	// Messages from authorized senders that @-tag the agent dispatch a real
+	// turn (agent.start skips only the mirror-back); everything else is
+	// recognized (via `appendedRelay` or the message shape) and cancelled —
+	// visible in the chat and thread history for the next real turn, but
+	// never dispatching inference by itself. Events this plugin published
+	// (mirrored prompts, chat posts) never come back at all: they are
+	// excluded by `ownEventIds` and the persisted seen set, so Amp-sent
+	// messages cannot trigger turns.
 	// -------------------------------------------------------------------
 	const watchedThreads = new Set<ThreadID>()
 	const appendedRelay = new Set<string>()
+	const triggerRelay = new Set<string>()
 	let polling = false
 
 	async function pollOnce() {
@@ -1114,15 +1167,22 @@ export default function (amp: PluginAPI) {
 					const agent = ensureAgentIdentity(config!)
 					const remote = fetchRemoteMessages(config!, agent, state, { ownEventIds, nameCache })
 					saveSession(threadId, state)
+					let members: Array<{ pubkey: string; role?: string }> | null = null
 					for (const m of remote) {
-						const text = formatIncoming(m)
-						appendedRelay.add(text)
+						let trigger = false
+						if (m.mentions_agent) {
+							members ??= channelMembers(config!, state.channel_id)
+							trigger = senderMayTrigger(config!, m.pubkey, members)
+						}
+						const text = trigger ? formatTrigger(m) : formatIncoming(m)
+						const set = trigger ? triggerRelay : appendedRelay
+						set.add(text)
 						try {
 							await amp.threads
 								.get(threadId)
 								.appendUserMessage({ type: 'user-message', content: text })
 						} catch (err) {
-							appendedRelay.delete(text)
+							set.delete(text)
 							logError('poll.append', err)
 							void amp.ui
 								.notify(`#${state.channel_name} · ${m.author}: ${truncate(m.content, 300)}`)
@@ -1150,6 +1210,15 @@ export default function (amp: PluginAPI) {
 		try {
 			const prompt = (event.message || '').trim()
 			if (!prompt) return {}
+
+			// A relay message from an authorized sender that mentions the
+			// agent: let the turn dispatch, but skip mirroring — the message
+			// already lives on the relay. The reply mirrors via agent.end.
+			if (triggerRelay.has(prompt) || TRIGGER_RE.test(prompt)) {
+				triggerRelay.delete(prompt)
+				watchedThreads.add(event.thread.id)
+				return {}
+			}
 
 			// A relay message the poller appended into the transcript: it is
 			// already visible and already lives on the relay — just prevent

@@ -53,6 +53,10 @@ Environment variables (or `~/.config/amp-buzz/config.json` with `relay_url` / `p
 ```bash
 export BUZZ_RELAY_URL="wss://your-relay.example.com"
 export BUZZ_PRIVATE_KEY="nsec1... or 64-char hex"   # your relay identity
+
+# optional: extra pubkeys allowed to trigger agent turns by @-mentioning the agent
+# (config.json equivalent: "trigger_pubkeys": ["npub1...", "hex..."])
+export AMP_BUZZ_TRIGGER_PUBKEYS="npub1...,npub1..."
 ```
 
 On first use the plugin generates an agent keypair for this machine, mints its NIP-OA owner attestation with your key, and stores both in `~/.config/amp-buzz/agent.json` (mode 0600). To use an agent identity provisioned elsewhere (e.g. created in Buzz Desktop), place its `seckey`, `pubkey`, and `auth_tag` in that file — the plugin never overwrites a valid one.
@@ -63,7 +67,9 @@ Just talk to Amp. The first prompt creates the channel and mirrors from there on
 
 **Chat without prompting Amp.** Press `Tab` until the mode picker shows **buzz chat**, then type — your message posts to the thread's channel under your key and Amp never runs. In any mode, a prompt starting with `\` does the same (`\lunch?` posts "lunch?" to the channel — Amp's slash-command UI captures a leading `/`, so backslash is the escape).
 
-**Live incoming messages.** New messages from collaborators appear directly in the Amp chat within seconds (10 s poll) as `<author>: …` messages. They never trigger Amp by themselves — the plugin cancels the turn before inference — but they become thread history, so Amp naturally sees them on your next prompt.
+**Live incoming messages.** New messages from collaborators appear directly in the Amp chat within seconds (10 s poll) as `<author>: …` messages. By default they never trigger Amp by themselves — the plugin cancels the turn before inference — but they become thread history, so Amp naturally sees them on your next prompt.
+
+**Mention-triggered turns.** A relay message that @-tags the thread's agent (carries its pubkey as a `p` tag) dispatches a real Amp turn — the agent responds and its reply is mirrored back to the channel. Only authorized senders can trigger: you (the plugin owner), channel owners/admins, or pubkeys listed in `trigger_pubkeys` in the config. Messages sent from Amp itself (mirrored prompts, chat posts) are excluded and can never re-trigger a turn.
 
 **Mention people.** Write `@name` in any mirrored prompt or chat message. Names resolve against channel members and relay profiles; a uniquely matching relay user is added to the channel and notified. Unresolvable `@text` is neutralized so sends never fail on incidental `@`s.
 

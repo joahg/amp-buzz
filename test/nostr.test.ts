@@ -3,6 +3,9 @@ import { test } from 'node:test'
 import {
 	bech32Encode,
 	extractAssistantText,
+	extractMentionTokens,
+	sanitizeMentions,
+	usernameSlug,
 	generateKeypair,
 	getPublicKey,
 	mintOwnerAttestation,
@@ -127,4 +130,39 @@ test('extractAssistantText collects text blocks across the turn', () => {
 	]
 	assert.strictEqual(extractAssistantText(messages), 'Working on it.\n\nDone: all tests pass.')
 	assert.strictEqual(extractAssistantText([messages[0]]), '')
+})
+
+test('usernameSlug', () => {
+	assert.strictEqual(usernameSlug('joah'), 'joah')
+	assert.strictEqual(usernameSlug('Joah Gerstenberg'), 'joah-gerstenberg')
+	assert.strictEqual(usernameSlug('amp (local)'), 'amp-local')
+	assert.strictEqual(usernameSlug('  @!#$  '), '')
+	assert.strictEqual(usernameSlug(''), '')
+	// stays within 24 chars and never ends with a dash
+	const long = usernameSlug('a'.repeat(23) + ' b' + 'c'.repeat(30))
+	assert.ok(long.length <= 24)
+	assert.ok(!long.endsWith('-'))
+})
+
+test('extractMentionTokens', () => {
+	assert.deepStrictEqual(extractMentionTokens('hey @joah, look at @code-review'), [
+		'joah',
+		'code-review',
+	])
+	assert.deepStrictEqual(extractMentionTokens('email me@example.com'), [])
+	assert.deepStrictEqual(extractMentionTokens('(@fizz) and @fizz again'), ['fizz'])
+	assert.deepStrictEqual(extractMentionTokens('no mentions here'), [])
+	assert.deepStrictEqual(extractMentionTokens('@a.b_c-d rocks'), ['a.b_c-d'])
+	// the buzz CLI treats even non-name @tokens as mentions — extract them too
+	assert.deepStrictEqual(extractMentionTokens('testing @-tags here'), ['-tags'])
+})
+
+test('sanitizeMentions neutralizes only the given tokens', () => {
+	const out = sanitizeMentions('cc @joah and @fizz about @joah', ['joah'])
+	assert.strictEqual(out, 'cc @\u200bjoah and @fizz about @\u200bjoah')
+	// regex metacharacters in a token must not break sanitization
+	const weird = sanitizeMentions('ping @a.b_c-d now', ['a.b_c-d'])
+	assert.strictEqual(weird, 'ping @\u200ba.b_c-d now')
+	// token as substring of a longer handle is untouched
+	assert.strictEqual(sanitizeMentions('see @joahg', ['joah']), 'see @joahg')
 })

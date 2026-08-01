@@ -1,3 +1,4 @@
+// @amp-agent-mode {"key":"buzz-chat","label":"buzz chat"}
 /**
  * amp-buzz — turn Amp into a buzz:// client.
  *
@@ -335,6 +336,8 @@ export interface SessionState {
 	created_at: number
 	last_seen: number
 	seen_event_ids: string[]
+	/** Remote messages surfaced live in the TUI, awaiting context injection on the next turn. */
+	pending?: RemoteMessage[]
 }
 
 export function readJson<T>(file: string, fallback: T | null = null): T | null {
@@ -443,7 +446,21 @@ export function buzz(
 	}
 }
 
-/** Send a message with content passed via stdin (preserves newlines). */
+function sendArgs(channelId: string, mentions: string[]): string[] {
+	const args = ['messages', 'send', '--channel', channelId, '--content', '-']
+	for (const m of mentions) args.push('--mention', m)
+	return args
+}
+
+/**
+ * Send a message with content passed via stdin (preserves newlines).
+ *
+ * The buzz CLI refuses to send content whose `@name` text does not resolve to
+ * a channel member. When that happens, resolve what we can (channel members
+ * by profile name, then exact-name relay users — who get added to the channel
+ * and notified) and neutralize the rest so the send never hard-fails on
+ * incidental @text.
+ */
 export function buzzSend(
 	config: BuzzConfig,
 	identity: Identity,
@@ -451,9 +468,153 @@ export function buzzSend(
 	content: string,
 	{ mentions = [] as string[] } = {},
 ): any {
-	const args = ['messages', 'send', '--channel', channelId, '--content', '-']
-	for (const m of mentions) args.push('--mention', m)
-	return buzz(config, identity, args, { input: content })
+	const first = buzz(config, identity, sendArgs(channelId, mentions), {
+		input: content,
+		allowFailure: true,
+	})
+	if (!first || !first.error) return first
+	if (!/mention/i.test(String(first.message))) throw new Error(String(first.message))
+
+	const { content: resolvedContent, mentions: extra } = resolveMentions(config, channelId, content)
+	const second = buzz(
+		config,
+		identity,
+		sendArgs(channelId, [...new Set([...mentions, ...extra])]),
+		{ input: resolvedContent, allowFailure: true },
+	)
+	if (!second || !second.error) return second
+
+	// Last resort: neutralize every @ so the CLI cannot parse any mention.
+	const neutral = content.replace(/@(?=\S)/g, '@\u200b')
+	return buzz(config, identity, sendArgs(channelId, mentions), { input: neutral })
+}
+
+// ---------------------------------------------------------------------------
+// Mentions
+// ---------------------------------------------------------------------------
+
+const MENTION_TOKEN_RE = /(^|[\s(])@([A-Za-z0-9._-]{1,64})/g
+
+/** Extract candidate @name tokens from message text. */
+export function extractMentionTokens(content: string): string[] {
+	const tokens = new Set<string>()
+	for (const m of content.matchAll(MENTION_TOKEN_RE)) tokens.add(m[2])
+	return [...tokens]
+}
+
+function escapeRegex(s: string): string {
+	return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+}
+
+/**
+ * Neutralize the given @tokens with a zero-width space so the buzz CLI stops
+ * treating them as mentions. Renders identically for readers.
+ */
+export function sanitizeMentions(content: string, tokens: string[]): string {
+	let out = content
+	for (const t of tokens) {
+		const re = new RegExp(`(^|[\\s(])@(${escapeRegex(t)})(?![A-Za-z0-9._-])`, 'g')
+		out = out.replace(re, '$1@\u200b$2')
+	}
+	return out
+}
+
+export function channelMembers(
+	config: BuzzConfig,
+	channelId: string,
+): Array<{ pubkey: string; role?: string }> {
+	const res = buzz(
+		config,
+		{ seckey: config.userSeckey },
+		['channels', 'members', '--channel', channelId],
+		{ allowFailure: true },
+	)
+	return Array.isArray(res) ? res : []
+}
+
+/** Map pubkey → display name for the given pubkeys. */
+export function userProfiles(config: BuzzConfig, pubkeys: string[]): Map<string, string> {
+	const names = new Map<string, string>()
+	if (pubkeys.length === 0) return names
+	const args = ['users', 'get']
+	for (const p of pubkeys) args.push('--pubkey', p)
+	const res = buzz(config, { seckey: config.userSeckey }, args, { allowFailure: true })
+	for (const u of Array.isArray(res) ? res : []) {
+		if (u.pubkey && u.display_name) names.set(u.pubkey, u.display_name)
+	}
+	return names
+}
+
+/** Case-insensitive substring search of relay users by display name. */
+export function searchUsers(
+	config: BuzzConfig,
+	name: string,
+): Array<{ pubkey: string; display_name: string }> {
+	const res = buzz(config, { seckey: config.userSeckey }, ['users', 'get', '--name', name], {
+		allowFailure: true,
+	})
+	const seen = new Set<string>()
+	const out: Array<{ pubkey: string; display_name: string }> = []
+	for (const u of Array.isArray(res) ? res : []) {
+		if (!u.pubkey || !u.display_name || seen.has(u.pubkey)) continue
+		seen.add(u.pubkey)
+		out.push({ pubkey: u.pubkey, display_name: u.display_name })
+	}
+	return out
+}
+
+/**
+ * Resolve @tokens in outgoing content: channel members match by profile name;
+ * otherwise a unique exact-name relay user is added to the channel (the
+ * author explicitly tagged them into the conversation) and mentioned.
+ * Unresolvable tokens are neutralized so the send cannot fail on them.
+ */
+export function resolveMentions(
+	config: BuzzConfig,
+	channelId: string,
+	content: string,
+): { content: string; mentions: string[] } {
+	const tokens = extractMentionTokens(content)
+	if (tokens.length === 0) return { content, mentions: [] }
+
+	const members = channelMembers(config, channelId)
+	const memberPubkeys = new Set(members.map((m) => m.pubkey))
+	const profiles = userProfiles(config, [...memberPubkeys])
+	const mentions: string[] = []
+	const unresolved: string[] = []
+
+	for (const token of tokens) {
+		const lower = token.toLowerCase()
+		const member = [...profiles.entries()].find(([, name]) => name.toLowerCase() === lower)
+		if (member) {
+			mentions.push(member[0])
+			continue
+		}
+		const matches = searchUsers(config, token).filter(
+			(u) => u.display_name.toLowerCase() === lower && !memberPubkeys.has(u.pubkey),
+		)
+		if (matches.length === 1) {
+			buzz(
+				config,
+				{ seckey: config.userSeckey },
+				[
+					'channels',
+					'add-member',
+					'--channel',
+					channelId,
+					'--pubkey',
+					matches[0].pubkey,
+					'--role',
+					'member',
+				],
+				{ allowFailure: true },
+			)
+			mentions.push(matches[0].pubkey)
+		} else {
+			unresolved.push(token)
+		}
+	}
+	return { content: sanitizeMentions(content, unresolved), mentions }
 }
 
 // ---------------------------------------------------------------------------
@@ -546,6 +707,29 @@ export function truncate(text: string, max = MAX_MIRROR_CHARS): string {
 }
 
 /**
+ * Resolve the channel name prefix: the user's relay profile name (slugified),
+ * falling back to the configured prefix when the profile has no name.
+ * Shared naming scheme with claude-code-buzz: `<username>--<slug>`.
+ */
+export function usernameSlug(name: string): string {
+	return name
+		.toLowerCase()
+		.replace(/[^a-z0-9]+/g, '-')
+		.replace(/^-+|-+$/g, '')
+		.slice(0, 24)
+		.replace(/-+$/, '')
+}
+
+export function resolveUsername(config: BuzzConfig): string {
+	const res = buzz(config, { seckey: config.userSeckey }, ['users', 'get'], {
+		allowFailure: true,
+	})
+	const profile = Array.isArray(res) ? res[0] : res
+	const name = profile && typeof profile.display_name === 'string' ? profile.display_name : ''
+	return usernameSlug(name) || config.channelPrefix
+}
+
+/**
  * Create the session channel following the required bootstrap order:
  * create channel → add agent as member with role bot →
  * first prompt (sent by the caller) carries the agent's p-tag mention.
@@ -556,7 +740,7 @@ export function createSessionChannel(
 	threadId: string,
 	firstPrompt: string,
 ): { id: string; name: string } {
-	const baseName = `${config.channelPrefix}--${slugify(firstPrompt)}`
+	const baseName = `${resolveUsername(config)}--${slugify(firstPrompt)}`
 	let channel: { id: string; name: string } | null = null
 	let name = baseName
 	for (let attempt = 0; attempt < 3 && !channel; attempt++) {
@@ -704,6 +888,8 @@ export function extractAssistantText(messages: ThreadMessage[]): string {
 // Plugin entrypoint
 // ---------------------------------------------------------------------------
 
+const CHAT_AGENT_NAME = 'buzz-chat'
+
 export default function (amp: PluginAPI) {
 	const config = loadConfig()
 	if (!config) {
@@ -714,28 +900,126 @@ export default function (amp: PluginAPI) {
 	}
 	amp.logger.log(`amp-buzz: mirroring threads to ${config.relayUrl}`)
 
-	amp.on('agent.start', (event: AgentStartEvent) => {
+	// "buzz chat" mode: Tab to it, type, and the message posts straight to the
+	// thread's Buzz channel. The turn is cancelled in agent.start, so this
+	// agent never actually runs inference.
+	const chatAgent = amp.createAgent({
+		name: CHAT_AGENT_NAME,
+		model: 'anthropic/claude-haiku-4-5-20251001',
+		instructions:
+			'You never run. Messages submitted in this mode are posted to the Buzz channel mirroring this thread, and the turn is cancelled before inference.',
+		tools: { include: [] },
+		display: { label: 'buzz chat', color: '#f5a623' },
+	})
+	amp.registerAgentMode({
+		key: 'buzz-chat',
+		label: 'buzz chat',
+		description: "Post messages to this thread's Buzz channel instead of prompting the agent",
+		agent: chatAgent.definition,
+	})
+
+	/** Ensure a session channel exists for a thread, creating it from the given text. */
+	function ensureSession(threadId: string, firstText: string): { state: SessionState; created: boolean } {
+		const agent = ensureAgentIdentity(config!)
+		let state = loadSession(threadId)
+		if (state && state.channel_id) return { state, created: false }
+		const channel = createSessionChannel(config!, agent, threadId, firstText)
+		state = {
+			channel_id: channel.id,
+			channel_name: channel.name,
+			created_at: Math.floor(Date.now() / 1000),
+			last_seen: Math.floor(Date.now() / 1000) - 5,
+			seen_event_ids: [],
+		}
+		saveSession(threadId, state)
+		return { state, created: true }
+	}
+
+	/** Post chat text to the thread's channel under the user's key. */
+	function postChat(threadId: string, text: string): SessionState {
+		const { state } = ensureSession(threadId, text)
+		buzzSend(config!, { seckey: config!.userSeckey }, state.channel_id, text)
+		return state
+	}
+
+	// -------------------------------------------------------------------
+	// Live incoming messages: poll watched threads and surface new remote
+	// messages in the TUI immediately. They are buffered in session state
+	// (`pending`) and injected as agent context on the next turn.
+	// -------------------------------------------------------------------
+	const watchedThreads = new Set<string>()
+
+	function pollOnce() {
+		for (const threadId of watchedThreads) {
+			try {
+				const state = loadSession(threadId)
+				if (!state || !state.channel_id) continue
+				const agent = ensureAgentIdentity(config!)
+				const remote = fetchRemoteMessages(config!, agent, state)
+				if (remote.length > 0) {
+					state.pending = [...(state.pending || []), ...remote].slice(-50)
+					for (const m of remote) {
+						void amp.ui
+							.notify(`#${state.channel_name} · ${m.author}: ${truncate(m.content, 300)}`)
+							.catch(() => {})
+					}
+				}
+				saveSession(threadId, state)
+			} catch (err) {
+				logError('poll', err)
+			}
+		}
+	}
+
+	const pollTimer = setInterval(pollOnce, 15_000)
+	if (typeof pollTimer.unref === 'function') pollTimer.unref()
+	amp.onDispose(() => clearInterval(pollTimer))
+
+	amp.on('session.start', (event) => {
+		if (loadSession(event.thread.id)) watchedThreads.add(event.thread.id)
+	})
+
+	amp.on('agent.start', async (event: AgentStartEvent, ctx) => {
 		try {
 			const prompt = (event.message || '').trim()
 			if (!prompt) return {}
-			const agent = ensureAgentIdentity(config)
-			let state = loadSession(event.thread.id)
-			let firstPrompt = false
 
-			if (!state || !state.channel_id) {
-				const channel = createSessionChannel(config, agent, event.thread.id, prompt)
-				state = {
-					channel_id: channel.id,
-					channel_name: channel.name,
-					created_at: Math.floor(Date.now() / 1000),
-					last_seen: Math.floor(Date.now() / 1000) - 5,
-					seen_event_ids: [],
+			// Buzz chat mode: post to the channel and cancel the turn.
+			let isChatMode = false
+			try {
+				const threadAgent = await ctx.thread.agent()
+				const def = threadAgent.definition
+				isChatMode = def.kind === 'agent-definition' && def.name === CHAT_AGENT_NAME
+			} catch {
+				// agent lookup unavailable; fall through to normal handling
+			}
+			// `//text` in any mode is a chat escape too.
+			const chatEscape = prompt.startsWith('//') ? prompt.slice(2).trim() : null
+			if (isChatMode || chatEscape) {
+				const text = isChatMode ? prompt : chatEscape!
+				if (text) {
+					const state = postChat(event.thread.id, text)
+					watchedThreads.add(event.thread.id)
+					void ctx.ui.notify(`→ #${state.channel_name}`).catch(() => {})
 				}
-				firstPrompt = true
+				await ctx.thread.cancel()
+				return {}
 			}
 
+			const agent = ensureAgentIdentity(config)
+			const { state, created: firstPrompt } = ensureSession(event.thread.id, prompt)
+			watchedThreads.add(event.thread.id)
+
 			mirrorPrompt(config, agent, state, prompt, { mentionAgent: firstPrompt })
-			const remote = fetchRemoteMessages(config, agent, state)
+			const fetched = fetchRemoteMessages(config, agent, state)
+			const pending = state.pending || []
+			state.pending = []
+			const seenIds = new Set<string>()
+			const remote = [...pending, ...fetched].filter((m) => {
+				if (seenIds.has(m.id)) return false
+				seenIds.add(m.id)
+				return true
+			})
 			saveSession(event.thread.id, state)
 
 			const contextParts: string[] = []
@@ -796,7 +1080,7 @@ export default function (amp: PluginAPI) {
 		{
 			title: 'Invite',
 			category: 'Buzz',
-			description: "Add a collaborator (pubkey or npub) to this thread's Buzz channel",
+			description: "Search relay users by name (or paste a pubkey) and add them to this thread's Buzz channel",
 		},
 		async (ctx) => {
 			try {
@@ -805,12 +1089,41 @@ export default function (amp: PluginAPI) {
 					await ctx.ui.notify('This thread has no Buzz channel yet — send a prompt first.')
 					return
 				}
-				const raw = await ctx.ui.input({
-					title: 'Invite to Buzz channel',
-					helpText: 'hex pubkey or npub1…',
-				})
+				const raw = (
+					(await ctx.ui.input({
+						title: 'Invite to Buzz channel',
+						helpText: 'name to search, hex pubkey, or npub1…',
+					})) || ''
+				).trim()
 				if (!raw) return
-				const pubkey = normalizePublicKey(raw)
+
+				let pubkey: string | null = null
+				let label = ''
+				try {
+					pubkey = normalizePublicKey(raw)
+				} catch {
+					// not a key — search the relay by name
+				}
+				if (!pubkey) {
+					const matches = searchUsers(config, raw)
+					if (matches.length === 0) {
+						await ctx.ui.notify(`No relay users matching “${raw}”`)
+						return
+					}
+					const options = matches.map((u) => `${u.display_name} (${u.pubkey.slice(0, 12)}…)`)
+					let chosen: string | undefined = options[0]
+					if (matches.length > 1) {
+						chosen = await ctx.ui.select({
+							title: `Invite to #${state.channel_name}`,
+							options,
+						})
+					}
+					const idx = chosen ? options.indexOf(chosen) : -1
+					if (idx === -1) return
+					pubkey = matches[idx].pubkey
+					label = matches[idx].display_name
+				}
+
 				buzz(config, { seckey: config.userSeckey }, [
 					'channels',
 					'add-member',
@@ -821,7 +1134,7 @@ export default function (amp: PluginAPI) {
 					'--role',
 					'member',
 				])
-				await ctx.ui.notify(`Added ${pubkey.slice(0, 8)}… to #${state.channel_name}`)
+				await ctx.ui.notify(`Added ${label || pubkey.slice(0, 8) + '…'} to #${state.channel_name}`)
 			} catch (err) {
 				logError('command.invite', err)
 				await ctx.ui.notify(`Invite failed: ${err instanceof Error ? err.message : err}`)
@@ -873,9 +1186,10 @@ export default function (amp: PluginAPI) {
 				}
 				const agent = ensureAgentIdentity(config)
 				// Peek without advancing the cursor so the messages still reach
-				// the agent as context on the next turn.
+				// the agent as context on the next turn. Include messages the
+				// background poller already buffered.
 				const peek: SessionState = { ...state, seen_event_ids: [...state.seen_event_ids] }
-				const remote = fetchRemoteMessages(config, agent, peek)
+				const remote = [...(state.pending || []), ...fetchRemoteMessages(config, agent, peek)]
 				await ctx.ui.notify(
 					remote.length === 0
 						? `No new remote messages on #${state.channel_name}`

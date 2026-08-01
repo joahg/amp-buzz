@@ -8,7 +8,7 @@ Every Amp thread becomes a private channel on your Buzz relay. Your prompts and 
 ┌────────────────┐  prompts (your key)         ┌──────────────┐
 │  Amp           │────────────────────────────▶│  Buzz relay  │
 │  + this plugin │  replies (agent key)        │  channel     │
-│                │────────────────────────────▶│  amp--…      │
+│                │────────────────────────────▶│  joah--…     │
 │                │◀────────────────────────────│              │
 └────────────────┘  remote messages → context  └──────┬───────┘
                                                       │
@@ -20,9 +20,9 @@ Every Amp thread becomes a private channel on your Buzz relay. Your prompts and 
 
 ## How it maps to the Buzz protocol
 
-- **One thread = one channel.** The first prompt of a thread creates a private channel named `amp--<slug-of-first-prompt>` (the `parent--sub` convention, kind 9007). The channel is the durable record of the thread.
+- **One thread = one channel.** The first prompt of a thread creates a private channel named `<your-username>--<slug-of-first-prompt>` (the `parent--sub` convention, kind 9007), using your relay profile name. The channel is the durable record of the thread. [claude-code-buzz](https://github.com/joahg/claude-code-buzz) uses the same naming scheme.
 - **Two identities.** Prompts are published under **your** Nostr key. Amp's replies are published under a dedicated **agent keypair** — never your key. The agent key carries a [NIP-OA](https://github.com/block/buzz/blob/main/docs/nips/NIP-OA.md) owner attestation minted with your key, so any client can verify you authorized it.
-- **Explicit turns.** Remote messages never trigger Amp automatically. They render into Amp's context at your next prompt (or on demand via the `Buzz: Catch up` command), clearly attributed to their authors.
+- **Explicit turns.** Remote messages never trigger Amp automatically. They surface live as TUI notifications and render into Amp's context at your next prompt (or on demand via the `Buzz: Catch up` command), clearly attributed to their authors.
 - **Graceful degradation.** No relay configured → the plugin does nothing and Amp behaves exactly as before. The plugin also stays inert when the Amp process is itself a managed Buzz agent (`BUZZ_MANAGED_AGENT` or `BUZZ_AUTH_TAG` set) — those turns already live on the relay.
 - **Client-only.** Works against a stock Buzz relay; no relay changes needed.
 
@@ -61,16 +61,20 @@ On first use the plugin generates an agent keypair for this machine, mints its N
 
 Just talk to Amp. The first prompt creates the channel and mirrors from there on.
 
+**Chat without prompting Amp.** Press `Tab` until the mode picker shows **buzz chat**, then type — your message posts to the thread's channel under your key and Amp never runs. In any mode, a prompt starting with `//` does the same (`// lunch?` posts "lunch?" to the channel).
+
+**Live incoming messages.** New messages from collaborators surface as TUI notifications within seconds (15 s poll), and still reach Amp as context on your next turn.
+
+**Mention people.** Write `@name` in any mirrored prompt or chat message. Names resolve against channel members and relay profiles; a uniquely matching relay user is added to the channel and notified. Unresolvable `@text` is neutralized so sends never fail on incidental `@`s.
+
 Command palette (`Buzz:` category):
 
 | Command | What it does |
 |---------|--------------|
 | `Buzz: Status` | Show relay, identities, and this thread's channel |
-| `Buzz: Invite` | Add a relay member (human or agent) to the thread channel |
+| `Buzz: Invite` | Search relay users by name (or paste a pubkey/npub) and add them to the thread channel |
 | `Buzz: Chat` | Post channel chat under your key — visible to collaborators, does **not** prompt Amp |
 | `Buzz: Catch up` | Show new remote messages now (they still reach Amp on your next turn) |
-
-Remote messages also arrive automatically: each prompt you send first mirrors to the channel, then injects anything collaborators posted since your last turn.
 
 ## What is (and isn't) mirrored
 

@@ -782,10 +782,22 @@ export function createSessionChannel(
 	return channel
 }
 
+let cachedAgentMentionName: string | null = null
+
+/** The agent's relay display name, for visible @-mention text. Memoized. */
+function agentMentionName(config: BuzzConfig, agent: AgentIdentity): string {
+	if (!cachedAgentMentionName) {
+		cachedAgentMentionName =
+			userProfiles(config, [agent.pubkey]).get(agent.pubkey) ||
+			`${AGENT_NAME} (${os.hostname().replace(/\.local$/, '')})`
+	}
+	return cachedAgentMentionName
+}
+
 /**
  * Publish a user prompt to the channel, signed by the user's key. Always
- * @-tags the thread's agent identity so relay clients can tell prompts
- * directed at the agent apart from ambient chat.
+ * @-tags the thread's agent identity — both as a mention tag and as visible
+ * `@<agent name>` text — so Buzz clients show who the prompt is directed at.
  */
 export function mirrorPrompt(
 	config: BuzzConfig,
@@ -793,7 +805,8 @@ export function mirrorPrompt(
 	state: SessionState,
 	prompt: string,
 ): any {
-	return buzzSend(config, { seckey: config.userSeckey }, state.channel_id, truncate(prompt), {
+	const content = `@${agentMentionName(config, agent)} ${truncate(prompt)}`
+	return buzzSend(config, { seckey: config.userSeckey }, state.channel_id, content, {
 		mentions: [agent.pubkey],
 	})
 }

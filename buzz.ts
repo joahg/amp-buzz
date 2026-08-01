@@ -782,16 +782,19 @@ export function createSessionChannel(
 	return channel
 }
 
-/** Publish a user prompt to the channel, signed by the user's key. */
+/**
+ * Publish a user prompt to the channel, signed by the user's key. Always
+ * @-tags the thread's agent identity so relay clients can tell prompts
+ * directed at the agent apart from ambient chat.
+ */
 export function mirrorPrompt(
 	config: BuzzConfig,
 	agent: AgentIdentity,
 	state: SessionState,
 	prompt: string,
-	{ mentionAgent = false } = {},
 ): any {
 	return buzzSend(config, { seckey: config.userSeckey }, state.channel_id, truncate(prompt), {
-		mentions: mentionAgent ? [agent.pubkey] : [],
+		mentions: [agent.pubkey],
 	})
 }
 
@@ -1077,7 +1080,7 @@ export default function (amp: PluginAPI) {
 			const { state, created: firstPrompt } = ensureSession(event.thread.id, prompt)
 			watchedThreads.add(event.thread.id)
 
-			const sent = mirrorPrompt(config, agent, state, prompt, { mentionAgent: firstPrompt })
+			const sent = mirrorPrompt(config, agent, state, prompt)
 			recordOwnEvent(event.thread.id, state, sent)
 
 			if (firstPrompt) {

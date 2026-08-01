@@ -229,6 +229,71 @@ test('senderMayTrigger permission model', async () => {
 	assert.ok(!senderMayTrigger(config, '', members))
 })
 
+test('agentDisplayName is unique per thread', async () => {
+	const { agentDisplayName } = await import('../buzz.ts')
+	const a = agentDisplayName('T-019fbdce-7a16-766e-8ba6-36b795531155')
+	const b = agentDisplayName('T-abc12345-0000-0000-0000-000000000000')
+	assert.notStrictEqual(a, b)
+	assert.ok(a.startsWith('Amp ('))
+	assert.ok(a.includes('019fbdce'))
+	assert.ok(b.includes('abc12345'))
+	// degenerate thread id still yields a name
+	assert.ok(agentDisplayName('').startsWith('Amp ('))
+})
+
+test('createSessionAgent mints a distinct attested identity per session', async () => {
+	const { createSessionAgent, verifyOwnerAttestation } = await import('../buzz.ts')
+	const owner = generateKeypair()
+	const config = {
+		relayUrl: 'wss://example.invalid',
+		userSeckey: owner.seckey,
+		userPubkey: owner.pubkey,
+		buzzBin: '/nonexistent/buzz', // profile setup is best-effort; must not throw
+		channelPrefix: 'amp',
+		triggerPubkeys: [],
+	}
+	const a = createSessionAgent(config, 'T-11111111-aaaa-bbbb-cccc-dddddddddddd')
+	const b = createSessionAgent(config, 'T-22222222-aaaa-bbbb-cccc-dddddddddddd')
+	assert.notStrictEqual(a.pubkey, b.pubkey)
+	assert.notStrictEqual(a.name, b.name)
+	assert.ok(verifyOwnerAttestation(a.authTag, a.pubkey))
+	assert.ok(verifyOwnerAttestation(b.authTag, b.pubkey))
+	assert.strictEqual(a.authTag[1], owner.pubkey)
+})
+
+test('sessionAgent returns the identity embedded in session state', async () => {
+	const { sessionAgent, generateKeypair: gen, mintOwnerAttestation: mint } = await import(
+		'../buzz.ts'
+	)
+	const owner = gen()
+	const kp = gen()
+	const config = {
+		relayUrl: 'wss://example.invalid',
+		userSeckey: owner.seckey,
+		userPubkey: owner.pubkey,
+		buzzBin: '/nonexistent/buzz',
+		channelPrefix: 'amp',
+		triggerPubkeys: [],
+	}
+	const state = {
+		channel_id: 'c1',
+		channel_name: 'test',
+		created_at: 1,
+		last_seen: 1,
+		seen_event_ids: [],
+		agent: {
+			seckey: kp.seckey,
+			pubkey: kp.pubkey,
+			auth_tag: mint(owner.seckey, kp.pubkey, ''),
+			name: 'Amp (host-deadbeef)',
+		},
+	}
+	const agent = sessionAgent(config, 'T-deadbeef-0000-0000-0000-000000000000', state)
+	assert.strictEqual(agent.pubkey, kp.pubkey)
+	assert.strictEqual(agent.seckey, kp.seckey)
+	assert.strictEqual(agent.name, 'Amp (host-deadbeef)')
+})
+
 test('formatHistoryBlocks batches history under the block cap', async () => {
 	const { formatHistoryBlocks, INCOMING_RE, INCOMING_MARK } = await import('../buzz.ts')
 	assert.deepStrictEqual(formatHistoryBlocks([]), [])

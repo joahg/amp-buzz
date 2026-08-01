@@ -21,7 +21,7 @@ Every Amp thread becomes a private channel on your Buzz relay. Your prompts and 
 ## How it maps to the Buzz protocol
 
 - **One thread = one channel.** The first prompt of a thread creates a private channel named `<your-username>--<slug-of-first-prompt>` (the `parent--sub` convention, kind 9007), using your relay profile name. The channel is the durable record of the thread. [claude-code-buzz](https://github.com/joahg/claude-code-buzz) uses the same naming scheme.
-- **Two identities.** Prompts are published under **your** Nostr key. Amp's replies are published under a dedicated **agent keypair** — never your key. The agent key carries a [NIP-OA](https://github.com/block/buzz/blob/main/docs/nips/NIP-OA.md) owner attestation minted with your key, so any client can verify you authorized it.
+- **Per-session identities.** Prompts are published under **your** Nostr key. Amp's replies are published under a dedicated **agent keypair minted for each session (thread)** — never your key, never shared between sessions — so every Amp session appears on the relay as its own agent (e.g. `Amp (myhost-019fbdce)`). Each agent key carries a [NIP-OA](https://github.com/block/buzz/blob/main/docs/nips/NIP-OA.md) owner attestation minted with your key, so any client can verify you authorized it.
 - **Explicit turns.** Remote messages never trigger Amp automatically. They appear live in the chat transcript as `<author>: …` messages and become context for your next prompt — but the plugin cancels their turns so they never dispatch inference.
 - **Graceful degradation.** No relay configured → the plugin does nothing and Amp behaves exactly as before. The plugin also stays inert when the Amp process is itself a managed Buzz agent (`BUZZ_MANAGED_AGENT` or `BUZZ_AUTH_TAG` set) — those turns already live on the relay.
 - **Client-only.** Works against a stock Buzz relay; no relay changes needed.
@@ -59,7 +59,7 @@ export BUZZ_PRIVATE_KEY="nsec1... or 64-char hex"   # your relay identity
 export AMP_BUZZ_TRIGGER_PUBKEYS="npub1...,npub1..."
 ```
 
-On first use the plugin generates an agent keypair for this machine, mints its NIP-OA owner attestation with your key, and stores both in `~/.config/amp-buzz/agent.json` (mode 0600). To use an agent identity provisioned elsewhere (e.g. created in Buzz Desktop), place its `seckey`, `pubkey`, and `auth_tag` in that file — the plugin never overwrites a valid one.
+When a session's channel is created (first prompt or `/join`), the plugin mints a fresh agent keypair for that session, mints its NIP-OA owner attestation with your key, and stores both in the session file under `~/.config/amp-buzz/sessions/` (mode 0600). Sessions created before per-session identities keep the shared machine identity in `~/.config/amp-buzz/agent.json`, whose pubkey their channels already reference.
 
 ## Use
 
@@ -91,8 +91,8 @@ Not mirrored: tool calls, thinking, streaming chunks, file contents. The channel
 
 | Path | Contents |
 |------|----------|
-| `~/.config/amp-buzz/agent.json` | Agent keypair + NIP-OA attestation |
-| `~/.config/amp-buzz/sessions/<thread-id>.json` | Thread → channel mapping, poll cursor |
+| `~/.config/amp-buzz/sessions/<thread-id>.json` | Thread → channel mapping, poll cursor, session agent keypair + NIP-OA attestation |
+| `~/.config/amp-buzz/agent.json` | Legacy shared agent identity (pre-per-session threads only) |
 | `~/.config/amp-buzz/error.log` | Failures (the plugin never blocks your thread) |
 
 ## Development

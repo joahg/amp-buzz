@@ -331,6 +331,14 @@ export interface AgentIdentity {
 	seckey: string
 	pubkey: string
 	authTag: AuthTag
+	name: string
+}
+
+export interface SessionAgentRecord {
+	seckey: string
+	pubkey: string
+	auth_tag: AuthTag
+	name: string
 }
 
 export interface SessionState {
@@ -339,6 +347,7 @@ export interface SessionState {
 	created_at: number
 	last_seen: number
 	seen_event_ids: string[]
+	agent?: SessionAgentRecord
 }
 
 export function readJson<T>(file: string, fallback: T | null = null): T | null {
@@ -728,41 +737,63 @@ export function resolveMentions(
 // Agent identity
 // ---------------------------------------------------------------------------
 
-const AGENT_FILE = () => path.join(STATE_DIR, 'agent.json')
+const LEGACY_AGENT_FILE = () => path.join(STATE_DIR, 'agent.json')
 const AGENT_NAME = 'Amp'
 
-/**
- * Ensure the plugin's agent identity exists: a keypair distinct from the
- * user's, carrying a NIP-OA owner attestation minted with the user's key.
- * The agent identity is per-machine and reused across threads.
- *
- * Externally provisioned identities (e.g. an agent created in Buzz Desktop)
- * are supported by placing { seckey, pubkey, auth_tag } in agent.json —
- * an existing valid file is never overwritten.
- */
-export function ensureAgentIdentity(config: BuzzConfig): AgentIdentity {
-	const existing = readJson<{ seckey: string; pubkey: string; auth_tag: AuthTag }>(AGENT_FILE())
-	if (
-		existing &&
-		existing.seckey &&
-		existing.pubkey &&
-		Array.isArray(existing.auth_tag) &&
-		verifyOwnerAttestation(existing.auth_tag, existing.pubkey)
-	) {
-		return { seckey: existing.seckey, pubkey: existing.pubkey, authTag: existing.auth_tag }
-	}
+function hostLabel(): string {
+	return os.hostname().replace(/\.local$/, '')
+}
 
+/**
+ * Display name for one session's agent identity: host plus a short thread
+ * suffix, so every Amp session shows up on Buzz as a distinct agent.
+ */
+export function agentDisplayName(threadId: string): string {
+	const suffix = threadId
+		.replace(/^T-/, '')
+		.replace(/[^a-zA-Z0-9]/g, '')
+		.slice(0, 8)
+	return suffix ? `${AGENT_NAME} (${hostLabel()}-${suffix})` : `${AGENT_NAME} (${hostLabel()})`
+}
+
+function toAgentRecord(agent: AgentIdentity): SessionAgentRecord {
+	return { seckey: agent.seckey, pubkey: agent.pubkey, auth_tag: agent.authTag, name: agent.name }
+}
+
+function fromAgentRecord(rec: SessionAgentRecord, threadId: string): AgentIdentity {
+	return {
+		seckey: rec.seckey,
+		pubkey: rec.pubkey,
+		authTag: rec.auth_tag,
+		name: rec.name || agentDisplayName(threadId),
+	}
+}
+
+function validAgentRecord(rec: SessionAgentRecord | undefined): rec is SessionAgentRecord {
+	return Boolean(
+		rec &&
+			rec.seckey &&
+			rec.pubkey &&
+			Array.isArray(rec.auth_tag) &&
+			verifyOwnerAttestation(rec.auth_tag, rec.pubkey),
+	)
+}
+
+/**
+ * Mint a fresh agent identity for one Amp session (thread): its own keypair
+ * carrying a NIP-OA owner attestation minted with the user's key, with a
+ * relay profile named after the host and thread. The identity lives in the
+ * thread's session state and is never shared across sessions.
+ */
+export function createSessionAgent(config: BuzzConfig, threadId: string): AgentIdentity {
 	const kp = generateKeypair()
 	const authTag = mintOwnerAttestation(config.userSeckey, kp.pubkey, '')
-	writeJson(AGENT_FILE(), {
+	const agent: AgentIdentity = {
 		seckey: kp.seckey,
 		pubkey: kp.pubkey,
-		auth_tag: authTag,
-		owner_pubkey: config.userPubkey,
-		created_at: Math.floor(Date.now() / 1000),
-	})
-
-	const agent: AgentIdentity = { seckey: kp.seckey, pubkey: kp.pubkey, authTag }
+		authTag,
+		name: agentDisplayName(threadId),
+	}
 	// Best-effort profile so other clients render a name for the agent.
 	buzz(
 		config,
@@ -771,12 +802,75 @@ export function ensureAgentIdentity(config: BuzzConfig): AgentIdentity {
 			'users',
 			'set-profile',
 			'--name',
-			`${AGENT_NAME} (${os.hostname().replace(/\.local$/, '')})`,
+			agent.name,
 			'--about',
-			'Amp thread agent — via the amp-buzz plugin',
+			`Amp session agent (thread ${threadId}) — via the amp-buzz plugin`,
 		],
 		{ allowFailure: true },
 	)
+	return agent
+}
+
+/**
+ * The shared per-machine identity from before per-session identities
+ * (~/.config/amp-buzz/agent.json). Sessions created back then keep it —
+ * its pubkey is what their channel membership and old mentions reference —
+ * but new sessions always mint their own.
+ */
+export function legacyAgentIdentity(): AgentIdentity | null {
+	const existing = readJson<{ seckey: string; pubkey: string; auth_tag: AuthTag }>(
+		LEGACY_AGENT_FILE(),
+	)
+	if (
+		existing &&
+		existing.seckey &&
+		existing.pubkey &&
+		Array.isArray(existing.auth_tag) &&
+		verifyOwnerAttestation(existing.auth_tag, existing.pubkey)
+	) {
+		return {
+			seckey: existing.seckey,
+			pubkey: existing.pubkey,
+			authTag: existing.auth_tag,
+			name: `${AGENT_NAME} (${hostLabel()})`,
+		}
+	}
+	return null
+}
+
+/**
+ * Resolve the agent identity for an existing session. Sessions predating
+ * per-session identities adopt the legacy shared one; a session with no
+ * usable identity at all gets a fresh one, added to its channel as a bot.
+ * The resolved identity is persisted into the session state.
+ */
+export function sessionAgent(
+	config: BuzzConfig,
+	threadId: string,
+	state: SessionState,
+): AgentIdentity {
+	if (validAgentRecord(state.agent)) return fromAgentRecord(state.agent, threadId)
+	const legacy = legacyAgentIdentity()
+	const agent = legacy ?? createSessionAgent(config, threadId)
+	if (!legacy && state.channel_id) {
+		buzz(
+			config,
+			{ seckey: config.userSeckey },
+			[
+				'channels',
+				'add-member',
+				'--channel',
+				state.channel_id,
+				'--pubkey',
+				agent.pubkey,
+				'--role',
+				'bot',
+			],
+			{ allowFailure: true },
+		)
+	}
+	state.agent = toAgentRecord(agent)
+	saveSession(threadId, state)
 	return agent
 }
 
@@ -890,18 +984,6 @@ export function createSessionChannel(
 	return channel
 }
 
-let cachedAgentMentionName: string | null = null
-
-/** The agent's relay display name, for visible @-mention text. Memoized. */
-function agentMentionName(config: BuzzConfig, agent: AgentIdentity): string {
-	if (!cachedAgentMentionName) {
-		cachedAgentMentionName =
-			userProfiles(config, [agent.pubkey]).get(agent.pubkey) ||
-			`${AGENT_NAME} (${os.hostname().replace(/\.local$/, '')})`
-	}
-	return cachedAgentMentionName
-}
-
 /**
  * Publish a user prompt to the channel, signed by the user's key. Always
  * @-tags the thread's agent identity — both as a mention tag and as visible
@@ -913,7 +995,7 @@ export function mirrorPrompt(
 	state: SessionState,
 	prompt: string,
 ): any {
-	const content = `@${agentMentionName(config, agent)} ${truncate(prompt)}`
+	const content = `@${agent.name} ${truncate(prompt)}`
 	return buzzSend(config, { seckey: config.userSeckey }, state.channel_id, content, {
 		mentions: [agent.pubkey],
 	})
@@ -1099,11 +1181,16 @@ export default function (amp: PluginAPI) {
 		agent: chatAgent.definition,
 	})
 
-	/** Ensure a session channel exists for a thread, creating it from the given text. */
-	function ensureSession(threadId: string, firstText: string): { state: SessionState; created: boolean } {
-		const agent = ensureAgentIdentity(config!)
+	/** Ensure a session channel exists for a thread, creating it (and the session's own agent identity) from the given text. */
+	function ensureSession(
+		threadId: string,
+		firstText: string,
+	): { state: SessionState; agent: AgentIdentity; created: boolean } {
 		let state = loadSession(threadId)
-		if (state && state.channel_id) return { state, created: false }
+		if (state && state.channel_id) {
+			return { state, agent: sessionAgent(config!, threadId, state), created: false }
+		}
+		const agent = createSessionAgent(config!, threadId)
 		const channel = createSessionChannel(config!, agent, threadId, firstText)
 		state = {
 			channel_id: channel.id,
@@ -1111,9 +1198,15 @@ export default function (amp: PluginAPI) {
 			created_at: Math.floor(Date.now() / 1000),
 			last_seen: Math.floor(Date.now() / 1000) - 5,
 			seen_event_ids: [],
+			agent: {
+				seckey: agent.seckey,
+				pubkey: agent.pubkey,
+				auth_tag: agent.authTag,
+				name: agent.name,
+			},
 		}
 		saveSession(threadId, state)
-		return { state, created: true }
+		return { state, agent, created: true }
 	}
 
 	// Event IDs this plugin published itself (mirrored prompts, chat posts):
@@ -1135,10 +1228,12 @@ export default function (amp: PluginAPI) {
 	 * recognize channel messages addressed to it.
 	 */
 	function relayIdentityNote(agent: AgentIdentity, channelName: string): string {
-		const name = agentMentionName(config!, agent)
+		const name = agent.name
 		return (
 			`Buzz relay context: this thread is mirrored to Buzz channel #${channelName}. ` +
 			`Your identity on the relay is "${name}" (pubkey ${agent.pubkey}). ` +
+			`Each Amp session has its own relay identity, so other "Amp (…)"-named users ` +
+			`on the channel are different sessions — treat them as separate collaborators, not as yourself. ` +
 			`Channel messages appear in this thread as "<author>: …" lines; ` +
 			`messages mentioning "@${name}" are directed at you. ` +
 			`To get another user's or agent's attention on the channel you MUST @-mention them ` +
@@ -1182,7 +1277,7 @@ export default function (amp: PluginAPI) {
 				try {
 					const state = loadSession(threadId)
 					if (!state || !state.channel_id) continue
-					const agent = ensureAgentIdentity(config!)
+					const agent = sessionAgent(config!, threadId, state)
 					const remote = fetchRemoteMessages(config!, agent, state, { ownEventIds, nameCache })
 					saveSession(threadId, state)
 					let members: Array<{ pubkey: string; role?: string }> | null = null
@@ -1237,7 +1332,7 @@ export default function (amp: PluginAPI) {
 				watchedThreads.add(event.thread.id)
 				const state = loadSession(event.thread.id)
 				if (state) {
-					const agent = ensureAgentIdentity(config)
+					const agent = sessionAgent(config, event.thread.id, state)
 					return {
 						message: { content: relayIdentityNote(agent, state.channel_name), display: false },
 					}
@@ -1278,8 +1373,7 @@ export default function (amp: PluginAPI) {
 				return {}
 			}
 
-			const agent = ensureAgentIdentity(config)
-			const { state, created: firstPrompt } = ensureSession(event.thread.id, prompt)
+			const { state, agent, created: firstPrompt } = ensureSession(event.thread.id, prompt)
 			watchedThreads.add(event.thread.id)
 
 			const sent = mirrorPrompt(config, agent, state, prompt)
@@ -1309,7 +1403,7 @@ export default function (amp: PluginAPI) {
 			if (!state || !state.channel_id) return
 			const reply = extractAssistantText(event.messages)
 			if (!reply) return
-			const agent = ensureAgentIdentity(config)
+			const agent = sessionAgent(config, event.thread.id, state)
 			mirrorReply(config, agent, state, reply)
 		} catch (err) {
 			logError('agent.end', err)
@@ -1321,18 +1415,19 @@ export default function (amp: PluginAPI) {
 		{ title: 'Status', category: 'Buzz', description: 'Show Buzz mirroring status for this thread' },
 		async (ctx) => {
 			try {
-				const agent = ensureAgentIdentity(config)
-				const lines = [
-					`Relay: ${config.relayUrl}`,
-					`Your pubkey: ${config.userPubkey}`,
-					`Agent pubkey: ${agent.pubkey} (${bech32Encode('npub', Buffer.from(agent.pubkey, 'hex'))})`,
-				]
+				const lines = [`Relay: ${config.relayUrl}`, `Your pubkey: ${config.userPubkey}`]
 				const state = ctx.thread ? loadSession(ctx.thread.id) : null
-				lines.push(
-					state
-						? `This thread → channel #${state.channel_name} (${state.channel_id})`
-						: 'This thread is not mirrored yet (the channel is created on your first prompt).',
-				)
+				if (state && ctx.thread) {
+					const agent = sessionAgent(config, ctx.thread.id, state)
+					lines.push(
+						`Session agent: ${agent.name} — ${agent.pubkey} (${bech32Encode('npub', Buffer.from(agent.pubkey, 'hex'))})`,
+						`This thread → channel #${state.channel_name} (${state.channel_id})`,
+					)
+				} else {
+					lines.push(
+						'This thread is not mirrored yet (the channel and its session agent identity are created on your first prompt).',
+					)
+				}
 				await ctx.ui.notify(lines.join('\n'))
 			} catch (err) {
 				logError('command.status', err)
@@ -1445,11 +1540,11 @@ export default function (amp: PluginAPI) {
 		async (ctx) => {
 			try {
 				const state = ctx.thread ? loadSession(ctx.thread.id) : null
-				if (!state) {
+				if (!state || !ctx.thread) {
 					await ctx.ui.notify('This thread has no Buzz channel yet — send a prompt first.')
 					return
 				}
-				const agent = ensureAgentIdentity(config)
+				const agent = sessionAgent(config, ctx.thread.id, state)
 				// Peek without advancing the cursor so the poller still appends
 				// these messages into the chat transcript.
 				const peek: SessionState = { ...state, seen_event_ids: [...state.seen_event_ids] }
@@ -1502,8 +1597,20 @@ export default function (amp: PluginAPI) {
 				buzz(config, { seckey: config.userSeckey }, ['channels', 'join', '--channel', channel.channel_id], {
 					allowFailure: true,
 				})
-				// Best-effort: the thread agent must be a member to publish replies.
-				const agent = ensureAgentIdentity(config)
+
+				const history = fetchChannelHistory(config, channel.channel_id)
+				const missing = [...new Set(history.map((m) => m.pubkey))].filter(
+					(p) => p && !nameCache.has(p),
+				)
+				if (missing.length > 0) {
+					const profiles = userProfiles(config, missing)
+					for (const p of missing) nameCache.set(p, profiles.get(p) || '')
+				}
+
+				const thread = await amp.getBuiltinAgent('medium').createThread({ show: true })
+				// This session gets its own agent identity, added to the channel
+				// as a bot so it can publish replies there.
+				const agent = createSessionAgent(config, thread.id)
 				buzz(
 					config,
 					{ seckey: config.userSeckey },
@@ -1519,17 +1626,6 @@ export default function (amp: PluginAPI) {
 					],
 					{ allowFailure: true },
 				)
-
-				const history = fetchChannelHistory(config, channel.channel_id)
-				const missing = [...new Set(history.map((m) => m.pubkey))].filter(
-					(p) => p && !nameCache.has(p),
-				)
-				if (missing.length > 0) {
-					const profiles = userProfiles(config, missing)
-					for (const p of missing) nameCache.set(p, profiles.get(p) || '')
-				}
-
-				const thread = await amp.getBuiltinAgent('medium').createThread({ show: true })
 				const now = Math.floor(Date.now() / 1000)
 				const newest = history.length > 0 ? history[history.length - 1].created_at : now
 				const state: SessionState = {
@@ -1538,14 +1634,18 @@ export default function (amp: PluginAPI) {
 					created_at: now,
 					last_seen: newest,
 					seen_event_ids: history.slice(-300).map((m) => m.id),
+					agent: {
+						seckey: agent.seckey,
+						pubkey: agent.pubkey,
+						auth_tag: agent.authTag,
+						name: agent.name,
+					},
 				}
 				saveSession(thread.id, state)
 				watchedThreads.add(thread.id)
 
 				const named = history.map((m) => ({
-					author:
-						(m.pubkey === agent.pubkey ? AGENT_NAME : nameCache.get(m.pubkey)) ||
-						(m.pubkey ? m.pubkey.slice(0, 8) : 'unknown'),
+					author: nameCache.get(m.pubkey) || (m.pubkey ? m.pubkey.slice(0, 8) : 'unknown'),
 					content: m.content,
 				}))
 				const blocks = [

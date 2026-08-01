@@ -17,6 +17,7 @@ import type {
 	AgentEndEvent,
 	AgentStartEvent,
 	PluginAPI,
+	ThreadID,
 	ThreadMessage,
 } from '@ampcode/plugin'
 import { createHash, randomBytes } from 'node:crypto'
@@ -336,8 +337,6 @@ export interface SessionState {
 	created_at: number
 	last_seen: number
 	seen_event_ids: string[]
-	/** Remote messages surfaced live in the TUI, awaiting context injection on the next turn. */
-	pending?: RemoteMessage[]
 }
 
 export function readJson<T>(file: string, fallback: T | null = null): T | null {
@@ -860,17 +859,17 @@ export function fetchRemoteMessages(
 	return remote
 }
 
-export function formatRemoteContext(state: SessionState, remote: RemoteMessage[]): string {
-	const lines = remote.map((m) => {
-		const flag = m.mentions_agent ? ' [mentions you]' : ''
-		return `- ${m.author}${flag}: ${truncate(m.content, 2000)}`
-	})
-	return [
-		`New messages from remote participants on Buzz channel #${state.channel_name} (this thread is mirrored there):`,
-		...lines,
-		'These are conversation context from collaborators watching this thread. Take them into account; address them directly only when relevant to the current prompt.',
-	].join('\n')
+/**
+ * Render an incoming relay message as it appears in the Amp transcript.
+ * The `💬 <author> in #<channel>:` shape is also the marker agent.start uses
+ * to recognize plugin-appended messages and cancel their turn.
+ */
+export function formatIncoming(m: RemoteMessage, channelName: string): string {
+	return `💬 ${m.author} in #${channelName}: ${truncate(m.content, 4000)}`.trim()
 }
+
+/** Matches the formatIncoming shape — fallback detection across plugin reloads. */
+export const INCOMING_RE = /^💬 .{1,80} in #[a-z0-9._-]{1,64}: /s
 
 /** Collect the assistant's text output from an agent.end message list. */
 export function extractAssistantText(messages: ThreadMessage[]): string {
@@ -943,35 +942,53 @@ export default function (amp: PluginAPI) {
 	}
 
 	// -------------------------------------------------------------------
-	// Live incoming messages: poll watched threads and surface new remote
-	// messages in the TUI immediately. They are buffered in session state
-	// (`pending`) and injected as agent context on the next turn.
+	// Live incoming messages: poll watched threads and append new remote
+	// messages straight into the Amp chat transcript. Each append starts a
+	// turn that agent.start recognizes (via `appendedRelay` or the message
+	// shape) and cancels — the message is visible in the chat and becomes
+	// thread history for the agent's next real turn, but never dispatches
+	// inference by itself.
 	// -------------------------------------------------------------------
-	const watchedThreads = new Set<string>()
+	const watchedThreads = new Set<ThreadID>()
+	const appendedRelay = new Set<string>()
+	let polling = false
 
-	function pollOnce() {
-		for (const threadId of watchedThreads) {
-			try {
-				const state = loadSession(threadId)
-				if (!state || !state.channel_id) continue
-				const agent = ensureAgentIdentity(config!)
-				const remote = fetchRemoteMessages(config!, agent, state)
-				if (remote.length > 0) {
-					state.pending = [...(state.pending || []), ...remote].slice(-50)
+	async function pollOnce() {
+		if (polling) return
+		polling = true
+		try {
+			for (const threadId of watchedThreads) {
+				try {
+					const state = loadSession(threadId)
+					if (!state || !state.channel_id) continue
+					const agent = ensureAgentIdentity(config!)
+					const remote = fetchRemoteMessages(config!, agent, state)
+					saveSession(threadId, state)
 					for (const m of remote) {
-						void amp.ui
-							.notify(`#${state.channel_name} · ${m.author}: ${truncate(m.content, 300)}`)
-							.catch(() => {})
+						const text = formatIncoming(m, state.channel_name)
+						appendedRelay.add(text)
+						try {
+							await amp.threads
+								.get(threadId)
+								.appendUserMessage({ type: 'user-message', content: text })
+						} catch (err) {
+							appendedRelay.delete(text)
+							logError('poll.append', err)
+							void amp.ui
+								.notify(`#${state.channel_name} · ${m.author}: ${truncate(m.content, 300)}`)
+								.catch(() => {})
+						}
 					}
+				} catch (err) {
+					logError('poll', err)
 				}
-				saveSession(threadId, state)
-			} catch (err) {
-				logError('poll', err)
 			}
+		} finally {
+			polling = false
 		}
 	}
 
-	const pollTimer = setInterval(pollOnce, 15_000)
+	const pollTimer = setInterval(() => void pollOnce(), 10_000)
 	if (typeof pollTimer.unref === 'function') pollTimer.unref()
 	amp.onDispose(() => clearInterval(pollTimer))
 
@@ -983,6 +1000,15 @@ export default function (amp: PluginAPI) {
 		try {
 			const prompt = (event.message || '').trim()
 			if (!prompt) return {}
+
+			// A relay message the poller appended into the transcript: it is
+			// already visible and already lives on the relay — just prevent
+			// the turn (no inference, no mirroring).
+			if (appendedRelay.has(prompt) || INCOMING_RE.test(prompt)) {
+				appendedRelay.delete(prompt)
+				await ctx.thread.cancel()
+				return {}
+			}
 
 			// Buzz chat mode: post to the channel and cancel the turn.
 			let isChatMode = false
@@ -1011,26 +1037,14 @@ export default function (amp: PluginAPI) {
 			watchedThreads.add(event.thread.id)
 
 			mirrorPrompt(config, agent, state, prompt, { mentionAgent: firstPrompt })
-			const fetched = fetchRemoteMessages(config, agent, state)
-			const pending = state.pending || []
-			state.pending = []
-			const seenIds = new Set<string>()
-			const remote = [...pending, ...fetched].filter((m) => {
-				if (seenIds.has(m.id)) return false
-				seenIds.add(m.id)
-				return true
-			})
-			saveSession(event.thread.id, state)
 
-			const contextParts: string[] = []
 			if (firstPrompt) {
-				contextParts.push(
-					`This thread is now mirrored to Buzz channel #${state.channel_name} on ${config.relayUrl}. Your replies are published there under the thread's agent identity; remote collaborators may join and post.`,
-				)
-			}
-			if (remote.length > 0) contextParts.push(formatRemoteContext(state, remote))
-			if (contextParts.length > 0) {
-				return { message: { content: contextParts.join('\n\n'), display: false } }
+				return {
+					message: {
+						content: `This thread is now mirrored to Buzz channel #${state.channel_name} on ${config.relayUrl}. Your replies are published there under the thread's agent identity; remote collaborators may join and post — their messages appear in this thread as 💬-prefixed messages.`,
+						display: false,
+					},
+				}
 			}
 		} catch (err) {
 			logError('agent.start', err)
@@ -1185,11 +1199,10 @@ export default function (amp: PluginAPI) {
 					return
 				}
 				const agent = ensureAgentIdentity(config)
-				// Peek without advancing the cursor so the messages still reach
-				// the agent as context on the next turn. Include messages the
-				// background poller already buffered.
+				// Peek without advancing the cursor so the poller still appends
+				// these messages into the chat transcript.
 				const peek: SessionState = { ...state, seen_event_ids: [...state.seen_event_ids] }
-				const remote = [...(state.pending || []), ...fetchRemoteMessages(config, agent, peek)]
+				const remote = fetchRemoteMessages(config, agent, peek)
 				await ctx.ui.notify(
 					remote.length === 0
 						? `No new remote messages on #${state.channel_name}`

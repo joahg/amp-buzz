@@ -166,3 +166,21 @@ test('sanitizeMentions neutralizes only the given tokens', () => {
 	// token as substring of a longer handle is untouched
 	assert.strictEqual(sanitizeMentions('see @joahg', ['joah']), 'see @joahg')
 })
+
+test('formatIncoming + INCOMING_RE round trip', async () => {
+	const { formatIncoming, INCOMING_RE } = await import('../buzz.ts')
+	const m = {
+		id: 'e1',
+		pubkey: 'p1',
+		author: 'amp (BLK...)',
+		content: 'hey there\nsecond line',
+		created_at: 1,
+		mentions_agent: false,
+	}
+	const text = formatIncoming(m, 'joah--fix-bug')
+	assert.strictEqual(text, '💬 amp (BLK...) in #joah--fix-bug: hey there\nsecond line')
+	assert.ok(INCOMING_RE.test(text))
+	// ordinary prompts must not match the marker
+	assert.ok(!INCOMING_RE.test('fix the bug in login.ts'))
+	assert.ok(!INCOMING_RE.test('💬 emoji but not the shape'))
+})

@@ -178,11 +178,13 @@ test('formatIncoming + INCOMING_RE round trip', async () => {
 		mentions_agent: false,
 	}
 	const text = formatIncoming(m)
-	assert.strictEqual(text, '💬 amp (BLK...): hey there\nsecond line')
+	assert.strictEqual(text, '[buzz] amp (BLK...): hey there\nsecond line')
 	assert.ok(INCOMING_RE.test(text))
-	// the pre-rename shape (with channel) must still be recognized
+	// older 💬-prefixed shapes must still be recognized
+	assert.ok(INCOMING_RE.test('💬 amp (BLK...): hey there'))
 	assert.ok(INCOMING_RE.test('💬 joah in #joah--fix-bug: older message'))
 	// ordinary prompts must not match the marker
 	assert.ok(!INCOMING_RE.test('fix the bug in login.ts'))
 	assert.ok(!INCOMING_RE.test('💬 emoji but not the shape'))
+	assert.ok(!INCOMING_RE.test('[buzz] emoji but not the shape'))
 })

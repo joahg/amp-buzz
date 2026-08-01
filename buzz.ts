@@ -881,18 +881,18 @@ export function fetchRemoteMessages(
 
 /**
  * Render an incoming relay message as it appears in the Amp transcript.
- * The `💬 <author>:` shape is also the marker agent.start uses to recognize
- * plugin-appended messages and cancel their turn.
+ * The `[buzz] <author>:` shape is also the marker agent.start uses to
+ * recognize plugin-appended messages and cancel their turn.
  */
 export function formatIncoming(m: RemoteMessage): string {
-	return `💬 ${m.author}: ${truncate(m.content, 4000)}`.trim()
+	return `[buzz] ${m.author}: ${truncate(m.content, 4000)}`.trim()
 }
 
 /**
  * Matches the formatIncoming shape — fallback detection across plugin
- * reloads. Also still matches the older `💬 <author> in #<channel>:` shape.
+ * reloads. Also still matches the older 💬-prefixed shapes.
  */
-export const INCOMING_RE = /^💬 .{1,80}?: /s
+export const INCOMING_RE = /^(?:\[buzz\]|💬) .{1,80}?: /s
 
 /** Collect the assistant's text output from an agent.end message list. */
 export function extractAssistantText(messages: ThreadMessage[]): string {
@@ -1058,8 +1058,10 @@ export default function (amp: PluginAPI) {
 			} catch {
 				// agent lookup unavailable; fall through to normal handling
 			}
-			// `//text` in any mode is a chat escape too.
-			const chatEscape = prompt.startsWith('//') ? prompt.slice(2).trim() : null
+			// A leading backslash in any mode is a chat escape too (`\lunch?`
+			// posts "lunch?"). Backslash instead of `//` because Amp's
+			// slash-command UI captures a leading `/`.
+			const chatEscape = prompt.startsWith('\\') ? prompt.replace(/^\\+/, '').trim() : null
 			if (isChatMode || chatEscape) {
 				const text = isChatMode ? prompt : chatEscape!
 				if (text) {
@@ -1081,7 +1083,7 @@ export default function (amp: PluginAPI) {
 			if (firstPrompt) {
 				return {
 					message: {
-						content: `This thread is now mirrored to Buzz channel #${state.channel_name} on ${config.relayUrl}. Your replies are published there under the thread's agent identity; remote collaborators may join and post — their messages appear in this thread as 💬-prefixed messages.`,
+						content: `This thread is now mirrored to Buzz channel #${state.channel_name} on ${config.relayUrl}. Your replies are published there under the thread's agent identity; remote collaborators may join and post — their messages appear in this thread as [buzz]-prefixed messages.`,
 						display: false,
 					},
 				}

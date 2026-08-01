@@ -1130,6 +1130,20 @@ export default function (amp: PluginAPI) {
 		saveSession(threadId, state)
 	}
 
+	/**
+	 * Context blurb teaching the agent its own relay identity, so it can
+	 * recognize channel messages addressed to it.
+	 */
+	function relayIdentityNote(agent: AgentIdentity, channelName: string): string {
+		const name = agentMentionName(config!, agent)
+		return (
+			`Buzz relay context: this thread is mirrored to Buzz channel #${channelName}. ` +
+			`Your identity on the relay is "${name}" (pubkey ${agent.pubkey}). ` +
+			`Channel messages appear in this thread as "<author>: …" lines; ` +
+			`messages mentioning "@${name}" are directed at you.`
+		)
+	}
+
 	/** Post chat text to the thread's channel under the user's key. */
 	function postChat(threadId: string, text: string): SessionState {
 		const { state } = ensureSession(threadId, text)
@@ -1217,6 +1231,13 @@ export default function (amp: PluginAPI) {
 			if (triggerRelay.has(prompt) || TRIGGER_RE.test(prompt)) {
 				triggerRelay.delete(prompt)
 				watchedThreads.add(event.thread.id)
+				const state = loadSession(event.thread.id)
+				if (state) {
+					const agent = ensureAgentIdentity(config)
+					return {
+						message: { content: relayIdentityNote(agent, state.channel_name), display: false },
+					}
+				}
 				return {}
 			}
 
@@ -1263,7 +1284,11 @@ export default function (amp: PluginAPI) {
 			if (firstPrompt) {
 				return {
 					message: {
-						content: `This thread is now mirrored to Buzz channel #${state.channel_name} on ${config.relayUrl}. Your replies are published there under the thread's agent identity; remote collaborators may join and post — their messages appear directly in this thread, attributed to their authors.`,
+						content:
+							`This thread is now mirrored to Buzz channel #${state.channel_name} on ${config.relayUrl}. ` +
+							`Your replies are published there under the thread's agent identity; remote collaborators may join and post — ` +
+							`their messages appear directly in this thread, attributed to their authors. ` +
+							relayIdentityNote(agent, state.channel_name),
 						display: false,
 					},
 				}
@@ -1519,7 +1544,11 @@ export default function (amp: PluginAPI) {
 						(m.pubkey ? m.pubkey.slice(0, 8) : 'unknown'),
 					content: m.content,
 				}))
-				for (const block of formatHistoryBlocks(named)) {
+				const blocks = [
+					INCOMING_MARK + relayIdentityNote(agent, channel.name),
+					...formatHistoryBlocks(named),
+				]
+				for (const block of blocks) {
 					appendedRelay.add(block)
 					try {
 						await thread.appendUserMessage({ type: 'user-message', content: block })

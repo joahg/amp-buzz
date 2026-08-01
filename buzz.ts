@@ -371,6 +371,10 @@ export function logError(context: string, err: unknown): void {
  * Returns null when no relay is configured — the plugin is inert then.
  */
 export function loadConfig(): BuzzConfig | null {
+	// When this process is itself a managed Buzz agent (e.g. an Amp instance
+	// driven by buzz-acp), its identity is an agent key and its turns already
+	// live on the relay — mirroring them again would spam channels.
+	if (process.env.BUZZ_MANAGED_AGENT || process.env.BUZZ_AUTH_TAG) return null
 	const file =
 		readJson<Record<string, string>>(path.join(STATE_DIR, 'config.json'), {}) ?? {}
 	const relayUrl = process.env.BUZZ_RELAY_URL || file.relay_url

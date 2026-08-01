@@ -23,7 +23,7 @@ Every Amp thread becomes a private channel on your Buzz relay. Your prompts and 
 - **One thread = one channel.** The first prompt of a thread creates a private channel named `amp--<slug-of-first-prompt>` (the `parent--sub` convention, kind 9007). The channel is the durable record of the thread.
 - **Two identities.** Prompts are published under **your** Nostr key. Amp's replies are published under a dedicated **agent keypair** — never your key. The agent key carries a [NIP-OA](https://github.com/block/buzz/blob/main/docs/nips/NIP-OA.md) owner attestation minted with your key, so any client can verify you authorized it.
 - **Explicit turns.** Remote messages never trigger Amp automatically. They render into Amp's context at your next prompt (or on demand via the `Buzz: Catch up` command), clearly attributed to their authors.
-- **Graceful degradation.** No relay configured → the plugin does nothing and Amp behaves exactly as before.
+- **Graceful degradation.** No relay configured → the plugin does nothing and Amp behaves exactly as before. The plugin also stays inert when the Amp process is itself a managed Buzz agent (`BUZZ_MANAGED_AGENT` or `BUZZ_AUTH_TAG` set) — those turns already live on the relay.
 - **Client-only.** Works against a stock Buzz relay; no relay changes needed.
 
 ## Requirements

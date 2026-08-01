@@ -178,8 +178,10 @@ test('formatIncoming + INCOMING_RE round trip', async () => {
 		mentions_agent: false,
 	}
 	const text = formatIncoming(m)
-	assert.strictEqual(text, '[buzz] amp (BLK...): hey there\nsecond line')
+	assert.strictEqual(text, '\u200bamp (BLK...): hey there\nsecond line')
 	assert.ok(INCOMING_RE.test(text))
+	// older [buzz]-prefixed shape must still be recognized
+	assert.ok(INCOMING_RE.test('[buzz] amp (BLK...): hey there'))
 	// older 💬-prefixed shapes must still be recognized
 	assert.ok(INCOMING_RE.test('💬 amp (BLK...): hey there'))
 	assert.ok(INCOMING_RE.test('💬 joah in #joah--fix-bug: older message'))

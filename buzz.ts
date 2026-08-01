@@ -884,18 +884,21 @@ export function fetchRemoteMessages(
 
 /**
  * Render an incoming relay message as it appears in the Amp transcript.
- * The `[buzz] <author>:` shape is also the marker agent.start uses to
- * recognize plugin-appended messages and cancel their turn.
+ * Rendered as `<author>: <content>` with a leading zero-width space — an
+ * invisible marker agent.start uses to recognize plugin-appended messages
+ * and cancel their turn (the TUI already labels them "Sent by plugin").
  */
+export const INCOMING_MARK = '\u200b'
+
 export function formatIncoming(m: RemoteMessage): string {
-	return `[buzz] ${m.author}: ${truncate(m.content, 4000)}`.trim()
+	return `${INCOMING_MARK}${m.author}: ${truncate(m.content, 4000)}`.trim()
 }
 
 /**
  * Matches the formatIncoming shape — fallback detection across plugin
- * reloads. Also still matches the older 💬-prefixed shapes.
+ * reloads. Also still matches the older `[buzz]`- and 💬-prefixed shapes.
  */
-export const INCOMING_RE = /^(?:\[buzz\]|💬) .{1,80}?: /s
+export const INCOMING_RE = /^(?:\u200b|\[buzz\] |💬 ).{1,80}?: /s
 
 /** Collect the assistant's text output from an agent.end message list. */
 export function extractAssistantText(messages: ThreadMessage[]): string {
@@ -1086,7 +1089,7 @@ export default function (amp: PluginAPI) {
 			if (firstPrompt) {
 				return {
 					message: {
-						content: `This thread is now mirrored to Buzz channel #${state.channel_name} on ${config.relayUrl}. Your replies are published there under the thread's agent identity; remote collaborators may join and post — their messages appear in this thread as [buzz]-prefixed messages.`,
+						content: `This thread is now mirrored to Buzz channel #${state.channel_name} on ${config.relayUrl}. Your replies are published there under the thread's agent identity; remote collaborators may join and post — their messages appear directly in this thread, attributed to their authors.`,
 						display: false,
 					},
 				}

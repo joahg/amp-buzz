@@ -1140,7 +1140,11 @@ export default function (amp: PluginAPI) {
 			`Buzz relay context: this thread is mirrored to Buzz channel #${channelName}. ` +
 			`Your identity on the relay is "${name}" (pubkey ${agent.pubkey}). ` +
 			`Channel messages appear in this thread as "<author>: …" lines; ` +
-			`messages mentioning "@${name}" are directed at you.`
+			`messages mentioning "@${name}" are directed at you. ` +
+			`To get another user's or agent's attention on the channel you MUST @-mention them ` +
+			`by their display name (e.g. "@joah") — untagged messages are ambient and may go unread. ` +
+			`Mentions notify people and can dispatch agent turns, so ONLY @-mention someone when ` +
+			`you actually need their attention; otherwise write names without the @.`
 		)
 	}
 

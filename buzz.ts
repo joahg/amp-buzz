@@ -20,6 +20,7 @@ import type {
 	AgentEndEvent,
 	AgentStartEvent,
 	PluginAPI,
+	PluginThread,
 	ThreadID,
 	ThreadMessage,
 } from '@ampcode/plugin'
@@ -139,6 +140,37 @@ export function generateKeypair(): { seckey: string; pubkey: string } {
 			return { seckey: sec.toString('hex'), pubkey: getPublicKey(sec.toString('hex')) }
 		}
 	}
+}
+
+/**
+ * Deterministically derive the custodian keypair from the owner's secret
+ * key (domain-separated tagged hash). The same owner key yields the same
+ * custodian on every machine, so custodian-owned channels survive the loss
+ * of any one machine's state directory (e.g. a discarded Blox workstation),
+ * and a different Buzz account can never end up reusing another account's
+ * custodian.
+ */
+export function deriveCustodianKeypair(ownerSeckeyHex: string): {
+	seckey: string
+	pubkey: string
+} {
+	const ownerPubkey = getPublicKey(ownerSeckeyHex)
+	for (let counter = 0; counter < 256; counter++) {
+		const h = taggedHash(
+			'amp-buzz/custodian-key/v1',
+			Buffer.from(ownerSeckeyHex, 'hex'),
+			Buffer.from([counter]),
+		)
+		const d = bytesToBigInt(h)
+		if (d <= 0n || d >= N) continue
+		const seckey = h.toString('hex')
+		const pubkey = getPublicKey(seckey)
+		// NIP-OA forbids self-attestation: step the counter in the
+		// (astronomically unlikely) case the derived key equals the owner's.
+		if (pubkey === ownerPubkey) continue
+		return { seckey, pubkey }
+	}
+	throw new Error('custodian key derivation failed')
 }
 
 /** BIP-340 Schnorr signature over a 32-byte message. Returns 64-byte sig hex. */
@@ -372,7 +404,9 @@ export function readJson<T>(file: string, fallback: T | null = null): T | null {
 
 export function writeJson(file: string, data: unknown): void {
 	fs.mkdirSync(path.dirname(file), { recursive: true })
-	const tmp = file + '.tmp'
+	// Unique temp name: concurrent Amp processes writing the same file must
+	// not interleave through one shared .tmp path.
+	const tmp = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`
 	fs.writeFileSync(tmp, JSON.stringify(data, null, 2), { mode: 0o600 })
 	fs.renameSync(tmp, file)
 }
@@ -462,13 +496,17 @@ export function buzz(
 	config: BuzzConfig,
 	identity: Identity,
 	args: string[],
-	{ allowFailure = false, input }: { allowFailure?: boolean; input?: string } = {},
+	{
+		allowFailure = false,
+		input,
+		timeoutMs = 20_000,
+	}: { allowFailure?: boolean; input?: string; timeoutMs?: number } = {},
 ): any {
 	try {
 		const out = execFileSync(config.buzzBin, args, {
 			env: buzzEnv(config, identity),
 			encoding: 'utf8',
-			timeout: 20_000,
+			timeout: timeoutMs,
 			maxBuffer: 16 * 1024 * 1024,
 			input,
 			stdio: ['pipe', 'pipe', 'pipe'],
@@ -606,14 +644,23 @@ export const HISTORY_MAX = 500
 export function fetchChannelHistory(
 	config: BuzzConfig,
 	channelId: string,
+	identity?: Identity,
 	max = HISTORY_MAX,
-): HistoryMessage[] {
+): HistoryMessage[] | null {
+	const as = identity ?? { seckey: config.userSeckey }
 	const byId = new Map<string, HistoryMessage>()
 	let before: number | undefined
 	for (let page = 0; page < Math.ceil(max / HISTORY_PAGE) + 1; page++) {
 		const args = ['messages', 'get', '--channel', channelId, '--limit', String(HISTORY_PAGE)]
 		if (before !== undefined) args.push('--before', String(before))
-		const res = buzz(config, { seckey: config.userSeckey }, args, { allowFailure: true })
+		const res = buzz(config, as, args, { allowFailure: true })
+		if (res && res.error) {
+			// A failed read is not an empty channel: the first page failing
+			// means we know nothing and callers must not commit state built
+			// on it; a later page failing yields the partial history so far.
+			if (page === 0) return null
+			break
+		}
 		const messages: any[] = Array.isArray(res) ? res : []
 		if (messages.length === 0) break
 		let oldest = Infinity
@@ -859,6 +906,191 @@ export function legacyAgentIdentity(): AgentIdentity | null {
 	return null
 }
 
+const CUSTODIAN_FILE = () => path.join(STATE_DIR, 'custodian.json')
+
+/**
+ * Stable identity that owns plugin-created session channels (their ephemeral
+ * session agent is only a bot member) and inherits ownership of legacy
+ * channels their sole-owner session agent abandons: the relay forbids the
+ * last owner from leaving, so with the custodian as owner, session
+ * identities can come and go while the channel and its history survive.
+ *
+ * Derived deterministically from the owner key, so it is identical on every
+ * machine and re-derivable after state-directory loss. custodian.json is
+ * only a cache that skips re-minting the attestation and re-publishing the
+ * relay profile; concurrent processes derive the same key, so a write race
+ * is harmless.
+ */
+export function custodianIdentity(config: BuzzConfig): AgentIdentity {
+	const kp = deriveCustodianKeypair(config.userSeckey)
+	const name = `${AGENT_NAME} custodian`
+	// The cache is only trusted when it matches the key derived from the
+	// *current* owner and is attested by that owner: a custodian.json left
+	// behind by a different Buzz account (or by the old random-key scheme)
+	// must never lend its authority here.
+	const rec = readJson<SessionAgentRecord>(CUSTODIAN_FILE())
+	if (
+		rec &&
+		validAgentRecord(rec) &&
+		rec.seckey === kp.seckey &&
+		rec.pubkey === kp.pubkey &&
+		rec.auth_tag[1] === config.userPubkey
+	) {
+		return {
+			seckey: rec.seckey,
+			pubkey: rec.pubkey,
+			authTag: rec.auth_tag,
+			name: rec.name || name,
+		}
+	}
+	const custodian: AgentIdentity = {
+		seckey: kp.seckey,
+		pubkey: kp.pubkey,
+		authTag: mintOwnerAttestation(config.userSeckey, kp.pubkey, ''),
+		name,
+	}
+	writeJson(CUSTODIAN_FILE(), toAgentRecord(custodian))
+	buzz(
+		config,
+		custodian,
+		[
+			'users',
+			'set-profile',
+			'--name',
+			custodian.name,
+			'--about',
+			'Holds ownership of Amp session channels whose session has ended or moved on — via the amp-buzz plugin',
+		],
+		{ allowFailure: true },
+	)
+	return custodian
+}
+
+/**
+ * Remove a session agent from a channel. When the relay refuses because the
+ * agent is the channel's last owner (plugin-created channels), ownership is
+ * handed to the custodian identity first, then the leave is retried.
+ */
+export function leaveChannel(
+	config: BuzzConfig,
+	agent: AgentIdentity,
+	channelId: string,
+): { left: boolean; detail?: string } {
+	const attempt = () =>
+		buzz(config, agentIdentity(agent), ['channels', 'leave', '--channel', channelId], {
+			allowFailure: true,
+		})
+	let res = attempt()
+	if (res && res.error && /owner/i.test(String(res.message))) {
+		const custodian = custodianIdentity(config)
+		buzz(
+			config,
+			agentIdentity(agent),
+			[
+				'channels',
+				'add-member',
+				'--channel',
+				channelId,
+				'--pubkey',
+				custodian.pubkey,
+				'--role',
+				'owner',
+			],
+			{ allowFailure: true },
+		)
+		res = attempt()
+	}
+	return res && res.error ? { left: false, detail: String(res.message) } : { left: true }
+}
+
+/**
+ * Join a destination channel for /join: the user's key joins (best-effort —
+ * the user may already be a member or not need to be one), the session agent
+ * is added as a bot, and membership is verified from the relay. The caller
+ * must treat ok=false as fatal — no state may be saved and no previous
+ * channel left, so a failed join can never orphan a moving thread from both
+ * channels.
+ */
+export function joinChannelAsAgent(
+	config: BuzzConfig,
+	channelId: string,
+	agent: AgentIdentity,
+): { ok: boolean; detail?: string } {
+	buzz(config, { seckey: config.userSeckey }, ['channels', 'join', '--channel', channelId], {
+		allowFailure: true,
+	})
+	const added = buzz(
+		config,
+		{ seckey: config.userSeckey },
+		['channels', 'add-member', '--channel', channelId, '--pubkey', agent.pubkey, '--role', 'bot'],
+		{ allowFailure: true },
+	)
+	const isMember = channelMembers(config, channelId, agentIdentity(agent)).some(
+		(m) => m.pubkey === agent.pubkey,
+	)
+	if (isMember) return { ok: true }
+	// A failed or timed-out add can still have committed on the relay, so
+	// compensate unconditionally — a leave for a never-added agent fails
+	// harmlessly, while skipping it could leave a dangling bot behind under
+	// a key the caller is about to discard.
+	buzz(config, agentIdentity(agent), ['channels', 'leave', '--channel', channelId], {
+		allowFailure: true,
+	})
+	return {
+		ok: false,
+		detail:
+			added && added.error ? truncate(String(added.message), 200) : 'agent is not a channel member',
+	}
+}
+
+/**
+ * Commit a /join after the agent's membership is verified: fetch the
+ * destination history and save the session state binding the thread to the
+ * channel. Returns null when the destination can't be read. Until the local
+ * state save succeeds, the destination membership is compensated with an
+ * unconditional leave — an unreadable history, a profile-lookup error, or a
+ * failed state write must not leave the agent dangling in a channel no
+ * session references.
+ */
+export function bindSessionToChannel(
+	config: BuzzConfig,
+	threadId: string,
+	agent: AgentIdentity,
+	channel: { channel_id: string; name: string },
+	nameCache: Map<string, string> = new Map(),
+): { state: SessionState; history: HistoryMessage[] } | null {
+	let committed = false
+	try {
+		const history = fetchChannelHistory(config, channel.channel_id, agentIdentity(agent))
+		if (history === null) return null
+		const missing = [...new Set(history.map((m) => m.pubkey))].filter((p) => p && !nameCache.has(p))
+		if (missing.length > 0) {
+			const profiles = userProfiles(config, missing)
+			for (const p of missing) nameCache.set(p, profiles.get(p) || '')
+		}
+		const now = Math.floor(Date.now() / 1000)
+		const newest = history.length > 0 ? history[history.length - 1].created_at : now
+		const state: SessionState = {
+			channel_id: channel.channel_id,
+			channel_name: channel.name,
+			created_at: now,
+			last_seen: newest,
+			seen_event_ids: history.slice(-300).map((m) => m.id),
+			user_is_member: true,
+			agent: toAgentRecord(agent),
+		}
+		saveSession(threadId, state)
+		committed = true
+		return { state, history }
+	} finally {
+		if (!committed) {
+			buzz(config, agentIdentity(agent), ['channels', 'leave', '--channel', channel.channel_id], {
+				allowFailure: true,
+			})
+		}
+	}
+}
+
 /**
  * Resolve the agent identity for an existing session. Sessions predating
  * per-session identities adopt the legacy shared one; a session with no
@@ -952,8 +1184,8 @@ export function resolveUsername(config: BuzzConfig): string {
 }
 
 /**
- * Create the session channel, signed by the session's agent identity: the
- * agent becomes the channel's owner (and sole member). The user's account is
+ * Create the session channel, owned by the stable custodian identity, with
+ * the session's ephemeral agent added as a bot member. The user's account is
  * deliberately never added, so plugin-created channels stay out of the
  * user's Buzz sidebar.
  */
@@ -963,13 +1195,19 @@ export function createSessionChannel(
 	threadId: string,
 	firstPrompt: string,
 ): { id: string; name: string } {
+	// The stable custodian owns the channel; the ephemeral session agent is
+	// only a bot member. The relay forbids the last owner from leaving, so a
+	// sole-owner session agent could never cleanly exit — with the custodian
+	// as owner, session identities can join and leave freely while the
+	// channel and its history survive.
+	const custodian = custodianIdentity(config)
 	const baseName = `${resolveUsername(config)}--${slugify(firstPrompt)}`
 	let channel: { id: string; name: string } | null = null
 	let name = baseName
 	for (let attempt = 0; attempt < 3 && !channel; attempt++) {
 		const res = buzz(
 			config,
-			agentIdentity(agent),
+			agentIdentity(custodian),
 			[
 				'channels',
 				'create',
@@ -992,6 +1230,29 @@ export function createSessionChannel(
 		}
 	}
 	if (!channel) throw new Error('failed to create session channel')
+	const added = buzz(
+		config,
+		agentIdentity(custodian),
+		[
+			'channels',
+			'add-member',
+			'--channel',
+			channel.id,
+			'--pubkey',
+			agent.pubkey,
+			'--role',
+			'bot',
+		],
+		{ allowFailure: true },
+	)
+	if (added && added.error) {
+		// The channel was created but no session can use it — delete it
+		// rather than orphaning a custodian-owned channel nobody references.
+		buzz(config, agentIdentity(custodian), ['channels', 'delete', '--channel', channel.id], {
+			allowFailure: true,
+		})
+		throw new Error(`failed to add session agent to #${channel.name}: ${String(added.message)}`)
+	}
 	return channel
 }
 
@@ -1117,7 +1378,7 @@ export function fetchRemoteMessages(
 export const INCOMING_MARK = '\u200b'
 
 export function formatIncoming(m: RemoteMessage): string {
-	return `${INCOMING_MARK}${m.author}: ${truncate(m.content, 4000)}`.trim()
+	return `${INCOMING_MARK}${m.author}: ${m.content}`.trim()
 }
 
 /**
@@ -1135,7 +1396,7 @@ export const INCOMING_RE = /^(?:\u200b|\[buzz\] |💬 ).{1,80}?: /s
 export const TRIGGER_MARK = '\u2060'
 
 export function formatTrigger(m: RemoteMessage): string {
-	return `${TRIGGER_MARK}${m.author}: ${truncate(m.content, 4000)}`.trim()
+	return `${TRIGGER_MARK}${m.author}: ${m.content}`.trim()
 }
 
 /** Matches the formatTrigger shape — fallback detection across plugin reloads. */
@@ -1156,6 +1417,16 @@ export function senderMayTrigger(
 	if (config.triggerPubkeys.includes(senderPubkey)) return true
 	const role = members.find((m) => m.pubkey === senderPubkey)?.role
 	return role === 'owner' || role === 'admin'
+}
+
+/** Whether a thread has no transcript at all — safe to bind a channel to in place. */
+export async function isEmptyThread(thread: Pick<PluginThread, 'messages'>): Promise<boolean> {
+	try {
+		const msgs = await thread.messages({ full: true, from: 'start', limit: 1 })
+		return msgs.length === 0
+	} catch {
+		return false
+	}
 }
 
 /** Collect the assistant's text output from an agent.end message list. */
@@ -1211,7 +1482,11 @@ export default function (amp: PluginAPI) {
 	): { state: SessionState; agent: AgentIdentity; created: boolean } {
 		let state = loadSession(threadId)
 		if (state && state.channel_id) {
-			return { state, agent: sessionAgent(config!, threadId, state), created: false }
+			const agent = sessionAgent(config!, threadId, state)
+			// Repair a dispose-time leave before posting: the relay rejects
+			// messages from a non-member.
+			ensureMembership(threadId, state)
+			return { state, agent, created: false }
 		}
 		const agent = createSessionAgent(config!, threadId)
 		const channel = createSessionChannel(config!, agent, threadId, firstText)
@@ -1230,6 +1505,8 @@ export default function (amp: PluginAPI) {
 			},
 		}
 		saveSession(threadId, state)
+		// The agent was just added by createSessionChannel — no repair needed.
+		membershipEnsured.add(threadId)
 		return { state, agent, created: true }
 	}
 
@@ -1303,7 +1580,46 @@ export default function (amp: PluginAPI) {
 	const watchedThreads = new Set<ThreadID>()
 	const appendedRelay = new Set<string>()
 	const triggerRelay = new Set<string>()
+	const membershipEnsured = new Set<ThreadID>()
 	let polling = false
+
+	/**
+	 * Undo a dispose-time leave: re-add the session identity to its channel
+	 * before it next polls or posts. Plugin-created channels use the
+	 * custodian's owner authority (the user is not a member there); joined
+	 * channels use the user's key. Marked ensured only once the relay
+	 * accepts (or reports the agent already a member), so a failure is
+	 * retried on the next poll, send, or session.start instead of being
+	 * suppressed forever.
+	 */
+	function ensureMembership(threadId: ThreadID, state: SessionState): void {
+		if (membershipEnsured.has(threadId)) return
+		if (!state.channel_id || !validAgentRecord(state.agent)) return
+		const authority: Identity =
+			state.user_is_member === false
+				? agentIdentity(custodianIdentity(config!))
+				: { seckey: config!.userSeckey }
+		const res = buzz(
+			config!,
+			authority,
+			[
+				'channels',
+				'add-member',
+				'--channel',
+				state.channel_id,
+				'--pubkey',
+				state.agent.pubkey,
+				'--role',
+				'bot',
+			],
+			{ allowFailure: true, timeoutMs: 10_000 },
+		)
+		if (!res || !res.error || /already/i.test(String(res.message))) {
+			membershipEnsured.add(threadId)
+		} else {
+			logError('ensure-membership add-member', res.message)
+		}
+	}
 
 	async function pollOnce() {
 		if (polling) return
@@ -1314,6 +1630,10 @@ export default function (amp: PluginAPI) {
 					const state = loadSession(threadId)
 					if (!state || !state.channel_id) continue
 					const agent = sessionAgent(config!, threadId, state)
+					// Repair a dispose-time leave before reading: a reload
+					// between session.start retries must not silently poll a
+					// channel the agent is no longer a member of.
+					ensureMembership(threadId, state)
 					const remote = fetchRemoteMessages(config!, agent, state, { ownEventIds, nameCache })
 					saveSession(threadId, state)
 					let members: Array<{ pubkey: string; role?: string }> | null = null
@@ -1349,10 +1669,43 @@ export default function (amp: PluginAPI) {
 
 	const pollTimer = setInterval(() => void pollOnce(), 10_000)
 	if (typeof pollTimer.unref === 'function') pollTimer.unref()
-	amp.onDispose(() => clearInterval(pollTimer))
+
+	// Best-effort "leave on close": Amp has no per-thread close event
+	// (AGNTOPS-400), so on graceful shutdown/reload each watched session's
+	// ephemeral identity leaves its channel, and ensureMembership re-adds it
+	// the next time the thread resumes, polls, or posts. The leaves run
+	// synchronously inside the dispose budget (~3s) and simply stop when it
+	// runs out — a detached child could outlive this process and race a
+	// successor plugin's re-add, removing the active identity with no retry. A
+	// single leave is safe for every channel whose ownership doesn't rest
+	// solely on the session agent: joined channels have other owners, and
+	// plugin-created channels are owned by the custodian. Legacy solo-owner
+	// channels fail the leave harmlessly (the relay rejects the last owner
+	// leaving) and get the custodian handoff the next time they move via
+	// /join.
+	amp.onDispose(() => {
+		clearInterval(pollTimer)
+		const deadline = Date.now() + 2_500
+		for (const threadId of watchedThreads) {
+			const remaining = deadline - Date.now()
+			if (remaining <= 0) break
+			const state = loadSession(threadId)
+			if (!state || !state.channel_id) continue
+			if (!validAgentRecord(state.agent)) continue
+			buzz(
+				config,
+				{ seckey: state.agent.seckey, authTag: state.agent.auth_tag },
+				['channels', 'leave', '--channel', state.channel_id],
+				{ allowFailure: true, timeoutMs: Math.min(remaining, 2_000) },
+			)
+		}
+	})
 
 	amp.on('session.start', (event) => {
-		if (loadSession(event.thread.id)) watchedThreads.add(event.thread.id)
+		const state = loadSession(event.thread.id)
+		if (!state) return
+		watchedThreads.add(event.thread.id)
+		ensureMembership(event.thread.id, state)
 	})
 
 	amp.on('agent.start', async (event: AgentStartEvent, ctx) => {
@@ -1608,7 +1961,8 @@ export default function (amp: PluginAPI) {
 		{
 			title: 'Join channel',
 			category: 'Buzz',
-			description: 'Join an existing Buzz channel in a new thread, importing its history',
+			description:
+				'Connect this thread to an existing Buzz channel (empty threads bind in place, bound threads move, others spawn a new thread), importing its history',
 		},
 		async (ctx) => {
 			try {
@@ -1637,56 +1991,80 @@ export default function (amp: PluginAPI) {
 				if (idx === -1) return
 				const channel = shown[idx]
 
-				buzz(config, { seckey: config.userSeckey }, ['channels', 'join', '--channel', channel.channel_id], {
-					allowFailure: true,
-				})
-
-				const history = fetchChannelHistory(config, channel.channel_id)
-				const missing = [...new Set(history.map((m) => m.pubkey))].filter(
-					(p) => p && !nameCache.has(p),
-				)
-				if (missing.length > 0) {
-					const profiles = userProfiles(config, missing)
-					for (const p of missing) nameCache.set(p, profiles.get(p) || '')
+				// Where the channel lands: a thread already bound to a channel
+				// MOVES (same identity; it leaves the old channel once the new
+				// binding is saved); an empty unbound thread is bound in place;
+				// anything else spawns a new thread from the current thread's
+				// agent — not getBuiltinAgent — so the agent mode and features
+				// carry over. Amp's plugin API exposes no way to read or copy
+				// the source thread's executor (AGNTOPS-400): the spawned
+				// thread gets the default executor of wherever this plugin
+				// host runs, which in practice keeps Blox-runner sessions on
+				// the runner but is not a guaranteed contract.
+				const current = ctx.thread
+				const existing = current ? loadSession(current.id) : null
+				if (existing && existing.channel_id === channel.channel_id) {
+					await ctx.ui.notify(`This thread is already connected to #${channel.name}`)
+					return
 				}
 
-				const thread = await amp.getBuiltinAgent('medium').createThread({ show: true })
-				// This session gets its own agent identity, added to the channel
-				// as a bot so it can publish replies there.
-				const agent = createSessionAgent(config, thread.id)
-				buzz(
-					config,
-					{ seckey: config.userSeckey },
-					[
-						'channels',
-						'add-member',
-						'--channel',
-						channel.channel_id,
-						'--pubkey',
-						agent.pubkey,
-						'--role',
-						'bot',
-					],
-					{ allowFailure: true },
-				)
-				const now = Math.floor(Date.now() / 1000)
-				const newest = history.length > 0 ? history[history.length - 1].created_at : now
-				const state: SessionState = {
-					channel_id: channel.channel_id,
-					channel_name: channel.name,
-					created_at: now,
-					last_seen: newest,
-					seen_event_ids: history.slice(-300).map((m) => m.id),
-					user_is_member: true,
-					agent: {
-						seckey: agent.seckey,
-						pubkey: agent.pubkey,
-						auth_tag: agent.authTag,
-						name: agent.name,
-					},
+				let thread: PluginThread
+				let agent: AgentIdentity
+				let previous: { channel_id: string; channel_name: string } | null = null
+				if (current && existing && existing.channel_id) {
+					thread = current
+					agent = sessionAgent(config, current.id, existing)
+					previous = { channel_id: existing.channel_id, channel_name: existing.channel_name }
+				} else if (current && (await isEmptyThread(current))) {
+					thread = current
+					agent = createSessionAgent(config, current.id)
+				} else {
+					const spawner = current
+						? await current.agent().catch(() => amp.getBuiltinAgent('medium'))
+						: amp.getBuiltinAgent('medium')
+					thread = await spawner.createThread({ show: true })
+					agent = createSessionAgent(config, thread.id)
 				}
-				saveSession(thread.id, state)
+
+				// The binding is only usable when the agent actually became a
+				// member (it must read and post there). Verified before saving
+				// any state or leaving the previous channel, so a failed join
+				// can never orphan a moving thread from both channels.
+				const joined = joinChannelAsAgent(config, channel.channel_id, agent)
+				if (!joined.ok) {
+					await ctx.ui.notify(
+						`Could not join #${channel.name}: ${joined.detail}` +
+							(previous ? ` — this thread stays on #${previous.channel_name}` : ''),
+					)
+					return
+				}
+
+				// Commit the binding: history fetch + state save, with an
+				// unconditional compensating leave of the destination until
+				// the local save succeeds (a failure in between must not
+				// strand the agent as a dangling bot).
+				const bound = bindSessionToChannel(config, thread.id, agent, channel, nameCache)
+				if (bound === null) {
+					await ctx.ui.notify(
+						`Could not read #${channel.name} history — join aborted` +
+							(previous ? ` — this thread stays on #${previous.channel_name}` : ''),
+					)
+					return
+				}
+				const { history } = bound
 				watchedThreads.add(thread.id)
+				membershipEnsured.add(thread.id)
+
+				// Moving: the ephemeral session identity leaves the previous
+				// channel only after the new binding is saved, so a failure
+				// above cannot orphan the thread from both channels.
+				let moveNote = ''
+				if (previous) {
+					const res = leaveChannel(config, agent, previous.channel_id)
+					moveNote = res.left
+						? ` — left #${previous.channel_name}`
+						: ` — could not leave #${previous.channel_name}: ${truncate(res.detail || 'unknown error', 120)}`
+				}
 
 				const named = history.map((m) => ({
 					author: nameCache.get(m.pubkey) || (m.pubkey ? m.pubkey.slice(0, 8) : 'unknown'),
@@ -1706,8 +2084,9 @@ export default function (amp: PluginAPI) {
 					}
 				}
 				await ctx.ui.notify(
-					`Joined #${channel.name}` +
-						(history.length > 0 ? ` — imported ${history.length} messages` : ''),
+					`${thread === current ? `Connected this thread to #${channel.name}` : `Joined #${channel.name} in a new thread`}` +
+						(history.length > 0 ? ` — imported ${history.length} messages` : '') +
+						moveNote,
 				)
 			} catch (err) {
 				logError('command.join', err)

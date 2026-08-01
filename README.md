@@ -79,9 +79,12 @@ Command palette (`Buzz:` category):
 | Command | What it does |
 |---------|--------------|
 | `Buzz: Status` | Show relay, identities, and this thread's channel |
+| `Buzz: Join channel` | Connect a thread to an existing channel, importing its history. An empty thread binds in place; a thread already bound to a channel **moves** (its identity leaves the old channel); anything else spawns a new thread from the current thread's agent, so agent mode and features carry over. Amp's plugin API exposes no way to copy the source thread's executor: the new thread uses the default executor where the plugin runs (in practice this keeps Blox-runner sessions on the runner, but it is not a guaranteed contract) |
 | `Buzz: Invite` | Search relay users by name (or paste a pubkey/npub) and add them to the thread channel |
 | `Buzz: Chat` | Post channel chat — visible to collaborators, does **not** prompt Amp |
 | `Buzz: Catch up` | Show new remote messages now (they still reach Amp on your next turn) |
+
+**Session lifecycle.** Each thread's ephemeral identity leaves its channel when the thread moves to another channel, and (best-effort) when Amp shuts down gracefully — it is quietly re-added when the thread resumes. Amp exposes no per-thread close event, so a crash can leave a stale member; the next resume or move cleans it up. Plugin-created channels are owned by a stable per-machine **custodian** identity (the session agent is only a bot member), so session identities can come and go while the channel and its history survive; a departing identity that is still a channel's last owner (legacy channels) hands ownership to the custodian first.
 
 ## What is (and isn't) mirrored
 
@@ -94,12 +97,13 @@ Not mirrored: tool calls, thinking, streaming chunks, file contents. The channel
 |------|----------|
 | `~/.config/amp-buzz/sessions/<thread-id>.json` | Thread → channel mapping, poll cursor, session agent keypair + NIP-OA attestation |
 | `~/.config/amp-buzz/agent.json` | Legacy shared agent identity (pre-per-session threads only) |
+| `~/.config/amp-buzz/custodian.json` | Per-machine custodian identity that inherits channels abandoned by their sole-owner session agent |
 | `~/.config/amp-buzz/error.log` | Failures (the plugin never blocks your thread) |
 
 ## Development
 
 ```bash
-node --test test/nostr.test.ts   # BIP-340 + NIP-OA test vectors (Node ≥ 22.6)
+node --test test/*.test.ts   # BIP-340 + NIP-OA vectors, session lifecycle (Node ≥ 22.6)
 ```
 
 The plugin is a single dependency-free TypeScript file: the embedded secp256k1/Schnorr/bech32 code is used only for one-time agent identity setup; all relay traffic goes through the `buzz` CLI.

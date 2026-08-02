@@ -12,6 +12,6 @@
 	"license": "Apache-2.0",
 	"keywords": ["amp", "buzz", "nostr", "collaboration", "relay", "multiplayer"],
 	"scripts": {
-		"test": "node --test test/nostr.test.ts"
+		"test": "node --test test/*.test.ts"
 	}
 }
